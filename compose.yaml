@@ -6,7 +6,8 @@ services:
     container_name: random_eat_bot
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - DB_PATH=/app/data/random_eat.db
       - TZ=Asia/Taipei

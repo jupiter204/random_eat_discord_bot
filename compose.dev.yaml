@@ -1,0 +1,22 @@
+services:
+  dev:
+    image: golang:1.24-alpine
+    container_name: random_eat_dev
+    working_dir: /app
+    volumes:
+      # 將專案根目錄掛載進容器，:Z 適配 Podman SELinux 標籤
+      - .:/app:Z
+      # 快取 go module 下載檔案，加速編譯與下載
+      - go-pkg-cache:/go/pkg/mod:Z
+    environment:
+      - DB_PATH=/app/data/random_eat.db
+      - TZ=Asia/Taipei
+    env_file:
+      - path: .env
+        required: false
+    command: ["sh"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  go-pkg-cache:
