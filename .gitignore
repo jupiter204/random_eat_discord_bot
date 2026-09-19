@@ -1,0 +1,28 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+random_eat
+
+# Environment and sensitive files
+.env
+.env.local
+
+# SQLite Database files
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,0 +1,15 @@
+services:
+  random-eat-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: random_eat_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/app/data/random_eat.db
+      - TZ=Asia/Taipei
+    volumes:
+      # :Z 參數專門用於 Podman / SELinux 權限標籤，確保容器能正確讀寫 SQLite 資料庫
+      - ./data:/app/data:Z
