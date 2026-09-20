@@ -1,20 +1,35 @@
 package googlemaps
 
+import (
+	"strings"
+	"time"
+)
+
 // LocalizedText 表示 Google API 的多語系文字結構
 type LocalizedText struct {
 	Text         string `json:"text"`
 	LanguageCode string `json:"languageCode,omitempty"`
 }
 
+// OpeningHours 代表 Google Places API 的營業時間結構
+type OpeningHours struct {
+	OpenNow             *bool    `json:"openNow,omitempty"`
+	WeekdayDescriptions []string `json:"weekdayDescriptions,omitempty"`
+	NextOpenTime        string   `json:"nextOpenTime,omitempty"`
+	NextCloseTime       string   `json:"nextCloseTime,omitempty"`
+}
+
 // Place 代表 Places API (New) 回傳的餐廳資料結構
 type Place struct {
-	ID               string        `json:"id"`
-	DisplayName      LocalizedText `json:"displayName"`
-	FormattedAddress string        `json:"formattedAddress"`
-	Rating           float64       `json:"rating,omitempty"`
-	UserRatingCount  int           `json:"userRatingCount,omitempty"`
-	GoogleMapsURI    string        `json:"googleMapsUri"`
-	PriceLevel       string        `json:"priceLevel,omitempty"`
+	ID                  string        `json:"id"`
+	DisplayName         LocalizedText `json:"displayName"`
+	FormattedAddress    string        `json:"formattedAddress"`
+	Rating              float64       `json:"rating,omitempty"`
+	UserRatingCount     int           `json:"userRatingCount,omitempty"`
+	GoogleMapsURI       string        `json:"googleMapsUri"`
+	PriceLevel          string        `json:"priceLevel,omitempty"`
+	CurrentOpeningHours *OpeningHours `json:"currentOpeningHours,omitempty"`
+	RegularOpeningHours *OpeningHours `json:"regularOpeningHours,omitempty"`
 }
 
 // FormattedPriceLevel 將 Google 價位列舉轉換為簡潔易讀符號
@@ -33,6 +48,68 @@ func (p *Place) FormattedPriceLevel() string {
 	default:
 		return "未提供"
 	}
+}
+
+// OpenStatusText 動態判斷並回傳當前營業狀態標籤
+func (p *Place) OpenStatusText() string {
+	var hours *OpeningHours
+	if p.CurrentOpeningHours != nil {
+		hours = p.CurrentOpeningHours
+	} else if p.RegularOpeningHours != nil {
+		hours = p.RegularOpeningHours
+	}
+
+	if hours == nil || hours.OpenNow == nil {
+		return "營業狀態未知 ⚪"
+	}
+
+	if *hours.OpenNow {
+		return "營業中 🟢"
+	}
+	return "休息中 🔴"
+}
+
+// TodayOpeningHours 取得今日的營業時間描述
+func (p *Place) TodayOpeningHours() string {
+	var hours *OpeningHours
+	if p.CurrentOpeningHours != nil {
+		hours = p.CurrentOpeningHours
+	} else if p.RegularOpeningHours != nil {
+		hours = p.RegularOpeningHours
+	}
+
+	if hours == nil || len(hours.WeekdayDescriptions) == 0 {
+		return "未提供營業時間"
+	}
+
+	// 載入台北時區以對應今日星期
+	loc, err := time.LoadLocation("Asia/Taipei")
+	if err != nil {
+		loc = time.FixedZone("CST", 8*3600)
+	}
+	todayWeekday := time.Now().In(loc).Weekday()
+
+	weekdayPrefixes := map[time.Weekday][]string{
+		time.Sunday:    {"星期日", "週日", "Sunday"},
+		time.Monday:    {"星期一", "週一", "Monday"},
+		time.Tuesday:   {"星期二", "週二", "Tuesday"},
+		time.Wednesday: {"星期三", "週三", "Wednesday"},
+		time.Thursday:  {"星期四", "週四", "Thursday"},
+		time.Friday:    {"星期五", "週五", "Friday"},
+		time.Saturday:  {"星期六", "週六", "Saturday"},
+	}
+
+	prefixes := weekdayPrefixes[todayWeekday]
+	for _, desc := range hours.WeekdayDescriptions {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(desc, prefix) {
+				return desc
+			}
+		}
+	}
+
+	// 若未匹配前綴，回傳第一筆
+	return hours.WeekdayDescriptions[0]
 }
 
 // LatLng 代表經緯度坐標

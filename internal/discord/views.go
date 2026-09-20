@@ -3,9 +3,10 @@ package discord
 import (
 	"fmt"
 
-	"github.com/bwmarrin/discordgo"
 	"random_eat_discord/internal/db"
 	"random_eat_discord/internal/lottery"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 const (
@@ -25,12 +26,17 @@ func RenderDrawEmbed(res *lottery.DrawResult) (*discordgo.MessageEmbed, []discor
 		ratingText = "⭐ 暫無評分"
 	}
 
-	description := fmt.Sprintf("%s • 價位：%s • 營業中 🟢", ratingText, place.FormattedPriceLevel())
+	description := fmt.Sprintf("%s • 價位：%s • %s", ratingText, place.FormattedPriceLevel(), place.OpenStatusText())
 
 	fields := []*discordgo.MessageEmbedField{
 		{
 			Name:   "📍 地址",
 			Value:  place.FormattedAddress,
+			Inline: false,
+		},
+		{
+			Name:   "⏰ 營業時間",
+			Value:  place.TodayOpeningHours(),
 			Inline: false,
 		},
 		{

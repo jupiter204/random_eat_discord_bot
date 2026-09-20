@@ -13,7 +13,7 @@ import (
 const (
 	nearbySearchURL = "https://places.googleapis.com/v1/places:searchNearby"
 	textSearchURL   = "https://places.googleapis.com/v1/places:searchText"
-	fieldMask       = "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel"
+	fieldMask       = "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours"
 )
 
 // Client 定義 Google Places API 用戶端介面
