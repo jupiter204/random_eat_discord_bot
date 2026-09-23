@@ -50,6 +50,28 @@ func (p *Place) FormattedPriceLevel() string {
 	}
 }
 
+// IsOpenNow 判斷店家目前是否正在營業
+func (p *Place) IsOpenNow() bool {
+	if p.CurrentOpeningHours != nil && p.CurrentOpeningHours.OpenNow != nil {
+		return *p.CurrentOpeningHours.OpenNow
+	}
+	if p.RegularOpeningHours != nil && p.RegularOpeningHours.OpenNow != nil {
+		return *p.RegularOpeningHours.OpenNow
+	}
+	return false
+}
+
+// FilterOpenPlaces 過濾出只包含目前正在營業的店家清單
+func FilterOpenPlaces(places []Place) []Place {
+	openPlaces := make([]Place, 0, len(places))
+	for _, p := range places {
+		if p.IsOpenNow() {
+			openPlaces = append(openPlaces, p)
+		}
+	}
+	return openPlaces
+}
+
 // OpenStatusText 動態判斷並回傳當前營業狀態標籤
 func (p *Place) OpenStatusText() string {
 	var hours *OpeningHours
@@ -137,7 +159,6 @@ type LocationBias struct {
 // NearbySearchRequest Places API (New) searchNearby 請求
 type NearbySearchRequest struct {
 	IncludedTypes       []string            `json:"includedTypes"`
-	OpenNow             bool                `json:"openNow"`
 	MaxResultCount      int                 `json:"maxResultCount"`
 	LocationRestriction LocationRestriction `json:"locationRestriction"`
 }
@@ -145,6 +166,7 @@ type NearbySearchRequest struct {
 // TextSearchRequest Places API (New) searchText 請求
 type TextSearchRequest struct {
 	TextQuery    string       `json:"textQuery"`
+	IncludedType string       `json:"includedType,omitempty"`
 	OpenNow      bool         `json:"openNow"`
 	LocationBias LocationBias `json:"locationBias"`
 }

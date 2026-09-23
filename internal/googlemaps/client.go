@@ -39,11 +39,12 @@ func NewClient(apiKey string) Client {
 
 // SearchNearbyRestaurants 搜尋指定坐標與半徑內營業中的餐廳
 func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]Place, error) {
-	reqBody := NearbySearchRequest{
-		IncludedTypes:  []string{"restaurant"},
-		OpenNow:        true,
-		MaxResultCount: 20,
-		LocationRestriction: LocationRestriction{
+	// Places API (New) 的 searchText 支援直接在伺服器端過濾 openNow: true
+	reqBody := TextSearchRequest{
+		TextQuery:    "餐廳",
+		IncludedType: "restaurant",
+		OpenNow:      true,
+		LocationBias: LocationBias{
 			Circle: Circle{
 				Center: LatLng{
 					Latitude:  lat,
@@ -54,10 +55,16 @@ func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng flo
 		},
 	}
 
-	return c.doPost(ctx, nearbySearchURL, reqBody)
+	places, err := c.doPost(ctx, textSearchURL, reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	// 確保雙重過濾：僅保留當前確認營業中之店家
+	return FilterOpenPlaces(places), nil
 }
 
-// SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的餐廳
+// SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的營業中餐廳
 func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]Place, error) {
 	reqBody := TextSearchRequest{
 		TextQuery: query,
@@ -73,7 +80,13 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 		},
 	}
 
-	return c.doPost(ctx, textSearchURL, reqBody)
+	places, err := c.doPost(ctx, textSearchURL, reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	// 確保雙重過濾：僅保留當前確認營業中之店家
+	return FilterOpenPlaces(places), nil
 }
 
 func (c *placesClient) doPost(ctx context.Context, url string, payload any) ([]Place, error) {
