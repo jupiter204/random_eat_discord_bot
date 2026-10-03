@@ -6,8 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
 	"random_eat_discord/internal/lottery"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 // Handler 封裝 Discord 事件處理器
@@ -84,6 +85,7 @@ func (h *Handler) handleSetCommand(s *discordgo.Session, i *discordgo.Interactio
 
 	err = h.lotteryService.SetPreference(ctx, userID, name, lat, lng, radius)
 	if err != nil {
+		slog.Warn("設定偏好位置失敗", "user_id", userID, "error", err)
 		embed := RenderErrorEmbed("設定失敗", err.Error())
 		_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 			Embeds: &[]*discordgo.MessageEmbed{embed},
@@ -92,6 +94,7 @@ func (h *Handler) handleSetCommand(s *discordgo.Session, i *discordgo.Interactio
 	}
 
 	pref, _ := h.lotteryService.GetPreference(ctx, userID)
+	slog.Info("設定偏好位置成功", "user_id", userID, "name", name, "latitude", lat, "longitude", lng, "radius", radius)
 	embed := RenderPreferenceEmbed(pref)
 	_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Embeds: &[]*discordgo.MessageEmbed{embed},
@@ -129,17 +132,22 @@ func (h *Handler) handleEatCommand(s *discordgo.Session, i *discordgo.Interactio
 		req.Radius = &r
 	}
 
+	slog.Info("收到抽籤請求", "user_id", req.UserID, "initiator", req.InitiatorName, "keyword", req.Keyword)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	res, err := h.lotteryService.Draw(ctx, req)
 	if err != nil {
+		slog.Error("抽籤失敗", "user_id", req.UserID, "initiator", req.InitiatorName, "keyword", req.Keyword, "error", err)
 		embed := RenderErrorEmbed("抽籤失敗", err.Error())
 		_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 			Embeds: &[]*discordgo.MessageEmbed{embed},
 		})
 		return
 	}
+
+	slog.Info("抽籤成功", "user_id", req.UserID, "restaurant", res.Restaurant.Name, "address", res.Restaurant.FormattedAddress)
 
 	embed, components := RenderDrawEmbed(res)
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
@@ -181,11 +189,16 @@ func (h *Handler) handleReroll(s *discordgo.Session, i *discordgo.InteractionCre
 		return
 	}
 
+	caller := getUserDisplayName(i)
+	callerID := getUserID(i)
+	slog.Info("收到再抽請求", "user_id", callerID, "initiator", caller, "session_id", sessionID)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	res, err := h.lotteryService.Reroll(ctx, sessionID)
 	if err != nil {
+		slog.Warn("重新抽籤失敗或過期", "user_id", callerID, "session_id", sessionID, "error", err)
 		// 清單過期或發生錯誤
 		errorEmbed := RenderErrorEmbed("無法再抽", err.Error())
 		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
@@ -196,7 +209,8 @@ func (h *Handler) handleReroll(s *discordgo.Session, i *discordgo.InteractionCre
 	}
 
 	// 覆蓋發起者為當前點擊按鈕的使用者
-	res.QueryCtx.Initiator = getUserDisplayName(i)
+	res.QueryCtx.Initiator = caller
+	slog.Info("重新抽籤成功", "user_id", callerID, "restaurant", res.Restaurant.Name, "session_id", sessionID)
 
 	embed, components := RenderDrawEmbed(res)
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
