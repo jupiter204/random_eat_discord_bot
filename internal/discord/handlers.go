@@ -147,7 +147,13 @@ func (h *Handler) handleEatCommand(s *discordgo.Session, i *discordgo.Interactio
 		return
 	}
 
-	slog.Info("抽籤成功", "user_id", req.UserID, "restaurant", res.Restaurant.Name, "address", res.Restaurant.FormattedAddress)
+	restaurantName := ""
+	address := ""
+	if res != nil && res.Place != nil {
+		restaurantName = res.Place.DisplayName.Text
+		address = res.Place.FormattedAddress
+	}
+	slog.Info("抽籤成功", "user_id", req.UserID, "restaurant", restaurantName, "address", address)
 
 	embed, components := RenderDrawEmbed(res)
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
@@ -210,7 +216,12 @@ func (h *Handler) handleReroll(s *discordgo.Session, i *discordgo.InteractionCre
 
 	// 覆蓋發起者為當前點擊按鈕的使用者
 	res.QueryCtx.Initiator = caller
-	slog.Info("重新抽籤成功", "user_id", callerID, "restaurant", res.Restaurant.Name, "session_id", sessionID)
+
+	restaurantName := ""
+	if res != nil && res.Place != nil {
+		restaurantName = res.Place.DisplayName.Text
+	}
+	slog.Info("重新抽籤成功", "user_id", callerID, "restaurant", restaurantName, "session_id", sessionID)
 
 	embed, components := RenderDrawEmbed(res)
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
