@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	fieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone"
+	fieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
 )
 
 // Client 定義 Google Places API 用戶端介面
@@ -130,7 +130,7 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 
 		pageResp, pageErr := c.doPost(ctx, endpoint, pageReq)
 		if pageErr != nil {
-			break
+			return nil, fmt.Errorf("取得第 %d 頁餐廳失敗: %w", currentPage, pageErr)
 		}
 
 		pageOpen := FilterOpenPlaces(pageResp.Places)

@@ -6,11 +6,11 @@
 
 ## ✨ 核心特色
 
-- 🚀 **超低資源消耗**：純 Go 實作（無 CGO 依賴），SQLite 採用單連線與記憶體限制最佳化，常駐記憶體僅約 **5~10 MB**。
+- 🚀 **輕量化架構**：純 Go 實作（無 CGO 依賴），SQLite 採用單連線與記憶體快取限制最佳化，無大型外部依賴，維持低資源佔用。
 - 💸 **API 呼叫與成本最佳化**：
     - **純座標定位**：使用者直接輸入經緯度，省去 Geocoding 地址轉換費用。
     - **單次搜尋與 Session 快取**：初次搜尋批次取得候選餐廳並快取於記憶體（10 分鐘 TTL），同一 `/eat` Session 的 Reroll 使用已取得的候選集合，**不會因每次 Reroll 再次呼叫 Google Places API**。
-    - **欄位遮罩 (Field Mask)**：使用精確的 Field Mask 控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
+    - **欄位遮罩 (Field Mask)**：使用精確的 Field Mask（包含 `nextPageToken`）控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
 - 🕔 **明確營業中過濾**：系統會使用 Google Places API 提供的 `currentOpeningHours.openNow` 判斷目前營業狀態，只保留 API 明確標示為營業中的餐廳；營業狀態未知的店家會排除。
 - 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應當地營業時間。
 - 🎯 **搜尋流程與半徑保證**：

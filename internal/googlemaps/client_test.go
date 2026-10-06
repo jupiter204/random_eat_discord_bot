@@ -115,11 +115,13 @@ func TestClient_SearchNearbyRestaurants_RequestContractAndSuccess(t *testing.T) 
 
 func TestClient_SearchTextRestaurants_ContractAndPagination(t *testing.T) {
 	var requestCount int32
+	var capturedFieldMask string
 	var page1Req TextSearchRequest
 	var page2Req TextSearchRequest
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count := atomic.AddInt32(&requestCount, 1)
+		capturedFieldMask = r.Header.Get("X-Goog-FieldMask")
 
 		if count == 1 {
 			_ = json.NewDecoder(r.Body).Decode(&page1Req)
@@ -167,6 +169,11 @@ func TestClient_SearchTextRestaurants_ContractAndPagination(t *testing.T) {
 		t.Fatalf("SearchTextRestaurants failed: %v", err)
 	}
 
+	// 驗證 Field Mask 必須包含 nextPageToken
+	if !strings.Contains(capturedFieldMask, "nextPageToken") {
+		t.Errorf("expected field mask to include nextPageToken, got: %s", capturedFieldMask)
+	}
+
 	// 驗證第 1 頁合約
 	if page1Req.TextQuery != "拉麵" {
 		t.Errorf("expected textQuery '拉麵', got %s", page1Req.TextQuery)
@@ -192,6 +199,48 @@ func TestClient_SearchTextRestaurants_ContractAndPagination(t *testing.T) {
 	// 驗證最終結果為第 2 頁篩選出的餐廳
 	if len(places) != 1 || places[0].ID != "place-page2-close" {
 		t.Fatalf("expected place-page2-close, got %+v", places)
+	}
+}
+
+func TestClient_SearchTextRestaurants_Page2ErrorNotSwallowed(t *testing.T) {
+	var requestCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requestCount, 1)
+
+		if count == 1 {
+			// 第 1 頁：無有效結果且提供 nextPageToken
+			resp := PlacesResponse{
+				Places: []Place{
+					{
+						ID:                  "place-far",
+						Location:            &LatLng{Latitude: 25.1000, Longitude: 121.5645},
+						CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+					},
+				},
+				NextPageToken: "token-page-2",
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// 第 2 頁：發生 API 錯誤 (例如 500)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error": "page 2 failed"}`))
+	}))
+	defer server.Close()
+
+	// 設定 maxRetries: 0 以便立即驗證錯誤回傳
+	client := NewTestClient("test-key", server.URL, 0, 10*time.Millisecond, nil)
+	places, err := client.SearchTextRestaurants(context.Background(), "拉麵", 25.0339, 121.5644, 1000)
+
+	// 驗證第 2 頁錯誤絕不被吞掉，且不得回傳 nil error 與空結果
+	if err == nil {
+		t.Fatalf("expected error when page 2 fails, got nil (places: %+v)", places)
+	}
+	if !strings.Contains(err.Error(), "取得第 2 頁餐廳失敗") && !strings.Contains(err.Error(), "500") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 

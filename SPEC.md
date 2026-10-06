@@ -7,7 +7,7 @@
 ### 核心設計理念
 
 - **零 Geocoding 費用**：由使用者直接提供精確經緯度坐標（例如：Google 地圖長按複製的 `25.0339, 121.5644`），免去地址解析與 Geocoding API 費用及延遲。
-- **極輕量與極低資源佔用**：純 Go SQLite 驅動，記憶體常駐約 5~10 MB。
+- **極輕量與低資源需求**：採用純 Go SQLite 驅動與單連線快取限制最佳化，無大型外部依賴，具備低資源需求特性。
 - **單次查詢與零 API 浪費重抽機制**：批次取得候選餐廳並暫存於記憶體（10 分鐘 TTL），按鈕重抽完全由記憶體挑選，不重新呼叫 Google API。
 - **嚴格過濾與品質保證**：嚴格限制餐廳類別、嚴格 Haversine 半徑限制、明確營業狀態過濾與所在時區動態解析。
 - **客觀隨機抽選**：隨機選擇範圍為 Google Places API 回傳並通過條件過濾後的候選集合，而非保證掌握半徑內所有餐廳之全局清單。
@@ -164,7 +164,7 @@ flowchart TD
       }
     }
     ```
-  - 分頁機制（Pagination）：若第 1 頁候選經半徑過濾後為 0 筆且存在 `nextPageToken`，最多使用 `pageToken` 額外抓取至第 2 頁，避免因 Google API 排序將遠處熱門店家排於首頁導致誤判無結果。
+  - 分頁機制（Pagination）：若第 1 頁候選經半徑過濾後為 0 筆且存在 `nextPageToken`，最多使用 `pageToken` 額外抓取至第 2 頁，避免因 Google API 排序將遠處熱門店家排於首頁導致誤判無結果；若分頁請求失敗則將錯誤回傳上層，不靜默吞掉。
 - **搜尋半徑保證（Haversine 距離過濾）**：
   - Nearby Search 透過 `locationRestriction` 限制圓形區域。
   - Text Search 透過 `locationBias` 搜尋候選，後端再以 Haversine 公式依實際經緯度計算店家與搜尋中心直線大圓距離：
@@ -175,7 +175,7 @@ flowchart TD
 - **時區解析（Timezone Awareness）**：
   - 依據 API 回傳之 `places.timeZone`（IANA ID 如 `Asia/Taipei`）或 `places.utcOffsetMinutes` 解析店家當地時間，對應精確今日星期，非硬編碼單一時區。
 - **Field Mask 與語系設定**：
-  - Header `X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone`
+  - Header `X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
   - Header `X-Goog-Language-Code: zh-TW`
   - Header `X-Goog-Api-Key: {GOOGLE_MAPS_API_KEY}`
 
