@@ -1,0 +1,271 @@
+package googlemaps
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestClient_SearchNearbyRestaurants_Success(t *testing.T) {
+	var capturedPath string
+	var capturedAPIKey string
+	var capturedFieldMask string
+	var capturedLang string
+	var capturedReq NearbySearchRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedAPIKey = r.Header.Get("X-Goog-Api-Key")
+		capturedFieldMask = r.Header.Get("X-Goog-FieldMask")
+		capturedLang = r.Header.Get("X-Goog-Language-Code")
+
+		_ = json.NewDecoder(r.Body).Decode(&capturedReq)
+
+		resp := PlacesResponse{
+			Places: []Place{
+				{
+					ID:                  "place-nearby-1",
+					DisplayName:         LocalizedText{Text: "優質拉麵"},
+					Location:            &LatLng{Latitude: 25.0340, Longitude: 121.5645}, // 距離極近 (~10m)
+					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+				},
+				{
+					ID:                  "place-nearby-closed",
+					DisplayName:         LocalizedText{Text: "打烊拉麵"},
+					Location:            &LatLng{Latitude: 25.0340, Longitude: 121.5645},
+					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(false)},
+				},
+				{
+					ID:                  "place-nearby-far",
+					DisplayName:         LocalizedText{Text: "遠方拉麵"},
+					Location:            &LatLng{Latitude: 25.0900, Longitude: 121.5645}, // 遠超 1000m
+					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+				},
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewTestClient("test-key-123", server.URL, 2, 10*time.Millisecond, nil)
+
+	places, err := client.SearchNearbyRestaurants(context.Background(), 25.0339, 121.5644, 1000)
+	if err != nil {
+		t.Fatalf("SearchNearbyRestaurants failed: %v", err)
+	}
+
+	// 驗證路徑與 Headers
+	if capturedPath != "/v1/places:searchNearby" {
+		t.Errorf("expected path /v1/places:searchNearby, got %s", capturedPath)
+	}
+	if capturedAPIKey != "test-key-123" {
+		t.Errorf("expected API Key test-key-123, got %s", capturedAPIKey)
+	}
+	if !strings.Contains(capturedFieldMask, "places.location") || !strings.Contains(capturedFieldMask, "places.id") {
+		t.Errorf("expected field mask with location and id, got %s", capturedFieldMask)
+	}
+	if capturedLang != "zh-TW" {
+		t.Errorf("expected language zh-TW, got %s", capturedLang)
+	}
+
+	// 驗證 Request Body
+	if len(capturedReq.IncludedTypes) != 1 || capturedReq.IncludedTypes[0] != "restaurant" {
+		t.Errorf("expected includedTypes [restaurant], got %v", capturedReq.IncludedTypes)
+	}
+	if !capturedReq.OpenNow {
+		t.Errorf("expected OpenNow true")
+	}
+	if capturedReq.LocationRestriction.Circle.Radius != 1000 {
+		t.Errorf("expected radius 1000, got %v", capturedReq.LocationRestriction.Circle.Radius)
+	}
+
+	// 驗證過濾結果：只應保留營業中且在 1000m 內的 place-nearby-1
+	if len(places) != 1 {
+		t.Fatalf("expected 1 filtered place, got %d", len(places))
+	}
+	if places[0].ID != "place-nearby-1" {
+		t.Errorf("expected place-nearby-1, got %s", places[0].ID)
+	}
+}
+
+func TestClient_SearchTextRestaurants_Success(t *testing.T) {
+	var capturedPath string
+	var capturedReq TextSearchRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&capturedReq)
+
+		resp := PlacesResponse{
+			Places: []Place{
+				{
+					ID:                  "place-text-1",
+					DisplayName:         LocalizedText{Text: "一蘭拉麵"},
+					Location:            &LatLng{Latitude: 25.0340, Longitude: 121.5645}, // 距離近
+					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+				},
+				{
+					ID:                  "place-text-far",
+					DisplayName:         LocalizedText{Text: "花蓮拉麵"},
+					Location:            &LatLng{Latitude: 23.9750, Longitude: 121.6050}, // 遠在花蓮
+					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+				},
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewTestClient("test-key-456", server.URL, 2, 10*time.Millisecond, nil)
+
+	places, err := client.SearchTextRestaurants(context.Background(), "拉麵", 25.0339, 121.5644, 1000)
+	if err != nil {
+		t.Fatalf("SearchTextRestaurants failed: %v", err)
+	}
+
+	if capturedPath != "/v1/places:searchText" {
+		t.Errorf("expected path /v1/places:searchText, got %s", capturedPath)
+	}
+	if capturedReq.TextQuery != "拉麵" {
+		t.Errorf("expected textQuery '拉麵', got %s", capturedReq.TextQuery)
+	}
+	if capturedReq.IncludedType != "restaurant" {
+		t.Errorf("expected includedType 'restaurant', got %s", capturedReq.IncludedType)
+	}
+	if !capturedReq.StrictTypeFiltering {
+		t.Errorf("expected StrictTypeFiltering true")
+	}
+
+	// 驗證花蓮拉麵已被 Haversine 半徑過濾排除
+	if len(places) != 1 {
+		t.Fatalf("expected 1 place, got %d", len(places))
+	}
+	if places[0].ID != "place-text-1" {
+		t.Errorf("expected place-text-1, got %s", places[0].ID)
+	}
+}
+
+func TestClient_NonRetryableErrors(t *testing.T) {
+	errorCodes := []int{
+		http.StatusBadRequest,   // 400
+		http.StatusUnauthorized, // 401
+		http.StatusForbidden,    // 403
+		http.StatusNotFound,     // 404
+	}
+
+	for _, statusCode := range errorCodes {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			var requestCount int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&requestCount, 1)
+				w.WriteHeader(statusCode)
+				_, _ = w.Write([]byte(`{"error": "client error"}`))
+			}))
+			defer server.Close()
+
+			client := NewTestClient("test-key", server.URL, 2, 10*time.Millisecond, nil)
+			_, err := client.SearchNearbyRestaurants(context.Background(), 25.0, 121.0, 1000)
+			if err == nil {
+				t.Fatalf("expected error for status %d, got nil", statusCode)
+			}
+
+			// 非暫態錯誤絕不可重試，請求數必須為 1
+			if count := atomic.LoadInt32(&requestCount); count != 1 {
+				t.Errorf("expected exactly 1 request for status %d, got %d", statusCode, count)
+			}
+		})
+	}
+}
+
+func TestClient_RetryTransientErrors(t *testing.T) {
+	transientCodes := []int{
+		http.StatusTooManyRequests,     // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout,      // 504
+	}
+
+	for _, statusCode := range transientCodes {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			var requestCount int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				count := atomic.AddInt32(&requestCount, 1)
+				if count < 3 {
+					w.WriteHeader(statusCode)
+					_, _ = w.Write([]byte(`{"error": "transient error"}`))
+					return
+				}
+				// 第 3 次重試成功
+				resp := PlacesResponse{
+					Places: []Place{
+						{
+							ID:                  "recovered-place",
+							DisplayName:         LocalizedText{Text: "重試成功餐廳"},
+							Location:            &LatLng{Latitude: 25.0, Longitude: 121.0},
+							CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+						},
+					},
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(resp)
+			}))
+			defer server.Close()
+
+			// 設定最多重試 2 次 (總共 3 次請求)
+			client := NewTestClient("test-key", server.URL, 2, 10*time.Millisecond, nil)
+			places, err := client.SearchNearbyRestaurants(context.Background(), 25.0, 121.0, 1000)
+			if err != nil {
+				t.Fatalf("expected success after retries for status %d, got error: %v", statusCode, err)
+			}
+
+			if count := atomic.LoadInt32(&requestCount); count != 3 {
+				t.Errorf("expected 3 requests for status %d, got %d", statusCode, count)
+			}
+			if len(places) != 1 || places[0].ID != "recovered-place" {
+				t.Errorf("unexpected places returned: %+v", places)
+			}
+		})
+	}
+}
+
+func TestClient_NetworkTimeoutAndCancellation(t *testing.T) {
+	// 模擬逾時
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	client := NewTestClient("test-key", server.URL, 2, 10*time.Millisecond, nil)
+	_, err := client.SearchNearbyRestaurants(ctx, 25.0, 121.0, 1000)
+	if err == nil {
+		t.Fatalf("expected context timeout error, got nil")
+	}
+}
+
+func TestClient_InvalidJSONResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{not-valid-json`))
+	}))
+	defer server.Close()
+
+	client := NewTestClient("test-key", server.URL, 0, 10*time.Millisecond, nil)
+	_, err := client.SearchNearbyRestaurants(context.Background(), 25.0, 121.0, 1000)
+	if err == nil || !strings.Contains(err.Error(), "解析 Places API 回應失敗") {
+		t.Fatalf("expected json parse error, got: %v", err)
+	}
+}

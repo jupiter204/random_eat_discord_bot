@@ -11,9 +11,7 @@ import (
 )
 
 const (
-	nearbySearchURL = "https://places.googleapis.com/v1/places:searchNearby"
-	textSearchURL   = "https://places.googleapis.com/v1/places:searchText"
-	fieldMask       = "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours"
+	fieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone"
 )
 
 // Client 定義 Google Places API 用戶端介面
@@ -25,26 +23,51 @@ type Client interface {
 type placesClient struct {
 	apiKey     string
 	httpClient *http.Client
+	baseURL    string
+	maxRetries int
+	baseDelay  time.Duration
 }
 
 // NewClient 建立 Google Places API 客戶端實例
 func NewClient(apiKey string) Client {
+	return newClientWithBaseURL(apiKey, "https://places.googleapis.com", 2, 100*time.Millisecond)
+}
+
+func newClientWithBaseURL(apiKey, baseURL string, maxRetries int, baseDelay time.Duration) *placesClient {
 	return &placesClient{
 		apiKey: apiKey,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		baseURL:    baseURL,
+		maxRetries: maxRetries,
+		baseDelay:  baseDelay,
 	}
 }
 
-// SearchNearbyRestaurants 搜尋指定坐標與半徑內營業中的餐廳
+// NewTestClient 供單元測試自訂伺服器與重試參數
+func NewTestClient(apiKey, baseURL string, maxRetries int, baseDelay time.Duration, httpClient *http.Client) Client {
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: 10 * time.Second,
+		}
+	}
+	return &placesClient{
+		apiKey:     apiKey,
+		httpClient: httpClient,
+		baseURL:    baseURL,
+		maxRetries: maxRetries,
+		baseDelay:  baseDelay,
+	}
+}
+
+// SearchNearbyRestaurants 搜尋指定坐標與半徑內營業中的餐廳 (使用 searchNearby)
 func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]Place, error) {
-	// Places API (New) 的 searchText 支援直接在伺服器端過濾 openNow: true
-	reqBody := TextSearchRequest{
-		TextQuery:    "餐廳",
-		IncludedType: "restaurant",
-		OpenNow:      true,
-		LocationBias: LocationBias{
+	reqBody := NearbySearchRequest{
+		IncludedTypes:  []string{"restaurant"},
+		MaxResultCount: 20,
+		OpenNow:        true,
+		LocationRestriction: LocationRestriction{
 			Circle: Circle{
 				Center: LatLng{
 					Latitude:  lat,
@@ -55,20 +78,25 @@ func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng flo
 		},
 	}
 
-	places, err := c.doPost(ctx, textSearchURL, reqBody)
+	endpoint := c.baseURL + "/v1/places:searchNearby"
+	places, err := c.doPost(ctx, endpoint, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	// 確保雙重過濾：僅保留當前確認營業中之店家
-	return FilterOpenPlaces(places), nil
+	// 確保雙重過濾：僅保留確認營業中之店家
+	openPlaces := FilterOpenPlaces(places)
+	// 嚴格半徑過濾：確保回傳店家在指定半徑內
+	return FilterByRadius(openPlaces, lat, lng, radiusMeters), nil
 }
 
-// SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的營業中餐廳
+// SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的營業中餐廳 (使用 searchText)
 func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]Place, error) {
 	reqBody := TextSearchRequest{
-		TextQuery: query,
-		OpenNow:   true,
+		TextQuery:           query,
+		IncludedType:        "restaurant",
+		StrictTypeFiltering: true,
+		OpenNow:             true,
 		LocationBias: LocationBias{
 			Circle: Circle{
 				Center: LatLng{
@@ -80,13 +108,29 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 		},
 	}
 
-	places, err := c.doPost(ctx, textSearchURL, reqBody)
+	endpoint := c.baseURL + "/v1/places:searchText"
+	places, err := c.doPost(ctx, endpoint, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	// 確保雙重過濾：僅保留當前確認營業中之店家
-	return FilterOpenPlaces(places), nil
+	// 確保雙重過濾：僅保留確認營業中之店家
+	openPlaces := FilterOpenPlaces(places)
+	// 嚴格半徑過濾：Text Search 使用 locationBias，以 Haversine 距離確保不超出指定 radiusMeters
+	return FilterByRadius(openPlaces, lat, lng, radiusMeters), nil
+}
+
+func isRetryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout:      // 504
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *placesClient) doPost(ctx context.Context, url string, payload any) ([]Place, error) {
@@ -95,35 +139,61 @@ func (c *placesClient) doPost(ctx context.Context, url string, payload any) ([]P
 		return nil, fmt.Errorf("序列化 API 請求失敗: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return nil, fmt.Errorf("建立 HTTP 請求失敗: %w", err)
+	var lastErr error
+	maxAttempts := 1 + c.maxRetries
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := c.baseDelay * (1 << (attempt - 1))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
+		if err != nil {
+			return nil, fmt.Errorf("建立 HTTP 請求失敗: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Goog-Api-Key", c.apiKey)
+		req.Header.Set("X-Goog-FieldMask", fieldMask)
+		req.Header.Set("X-Goog-Language-Code", "zh-TW")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = fmt.Errorf("呼叫 Places API 失敗: %w", err)
+			continue
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("讀取 Places API 回應失敗: %w", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("Places API 回傳錯誤 (Status %d): %s", resp.StatusCode, string(respBody))
+			if isRetryableStatus(resp.StatusCode) {
+				continue
+			}
+			// 非暫態錯誤（例如 400, 401, 403, 404）不進行重試，直接中斷
+			return nil, lastErr
+		}
+
+		var placesResp PlacesResponse
+		if err := json.Unmarshal(respBody, &placesResp); err != nil {
+			return nil, fmt.Errorf("解析 Places API 回應失敗: %w", err)
+		}
+
+		return placesResp.Places, nil
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Goog-Api-Key", c.apiKey)
-	req.Header.Set("X-Goog-FieldMask", fieldMask)
-	req.Header.Set("X-Goog-Language-Code", "zh-TW")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("呼叫 Places API 失敗: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("讀取 Places API 回應失敗: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Places API 回傳錯誤 (Status %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var placesResp PlacesResponse
-	if err := json.Unmarshal(respBody, &placesResp); err != nil {
-		return nil, fmt.Errorf("解析 Places API 回應失敗: %w", err)
-	}
-
-	return placesResp.Places, nil
+	return nil, lastErr
 }

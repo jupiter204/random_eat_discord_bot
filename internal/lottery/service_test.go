@@ -2,8 +2,9 @@ package lottery
 
 import (
 	"context"
+	"math"
+	"sync"
 	"testing"
-	"time"
 
 	"random_eat_discord/internal/db"
 	"random_eat_discord/internal/googlemaps"
@@ -37,14 +38,25 @@ func (m *mockRepository) DeletePreference(ctx context.Context, userID string) er
 
 type mockMapsClient struct {
 	places []googlemaps.Place
+	err    error
 }
 
 func (m *mockMapsClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]googlemaps.Place, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	return m.places, nil
 }
 
 func (m *mockMapsClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]googlemaps.Place, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	return m.places, nil
+}
+
+func floatPtr(f float64) *float64 {
+	return &f
 }
 
 func TestCoordinateValidation(t *testing.T) {
@@ -59,6 +71,12 @@ func TestCoordinateValidation(t *testing.T) {
 		{"Invalid Lat Low", -90.5, 121.5644, true},
 		{"Invalid Lng High", 25.0, 181.0, true},
 		{"Invalid Lng Low", 25.0, -181.0, true},
+		{"Invalid Lat NaN", math.NaN(), 121.5644, true},
+		{"Invalid Lng NaN", 25.0339, math.NaN(), true},
+		{"Invalid Lat +Inf", math.Inf(1), 121.5644, true},
+		{"Invalid Lat -Inf", math.Inf(-1), 121.5644, true},
+		{"Invalid Lng +Inf", 25.0339, math.Inf(1), true},
+		{"Invalid Lng -Inf", 25.0339, math.Inf(-1), true},
 	}
 
 	for _, tt := range tests {
@@ -71,85 +89,241 @@ func TestCoordinateValidation(t *testing.T) {
 	}
 }
 
-func TestSessionCacheReroll(t *testing.T) {
-	cache := NewSessionCache()
-	defer cache.Stop()
-
-	places := []googlemaps.Place{
-		{ID: "p1", DisplayName: googlemaps.LocalizedText{Text: "餐廳 A"}},
-		{ID: "p2", DisplayName: googlemaps.LocalizedText{Text: "餐廳 B"}},
-		{ID: "p3", DisplayName: googlemaps.LocalizedText{Text: "餐廳 C"}},
-	}
-
-	qCtx := QueryContext{
-		Latitude:  25.0339,
-		Longitude: 121.5644,
-		Radius:    1000,
-	}
-
-	sessionID := "test-session-123"
-	cache.Store(sessionID, places, qCtx, 5*time.Second)
-
-	picked := make(map[string]bool)
-	for i := 0; i < 3; i++ {
-		p, remaining, _, ok := cache.PickNext(sessionID)
-		if !ok {
-			t.Fatalf("PickNext failed on iteration %d", i)
-		}
-		if picked[p.ID] {
-			t.Fatalf("Duplicate place picked: %s", p.ID)
-		}
-		picked[p.ID] = true
-		expectedRemaining := 3 - (i + 1)
-		if remaining != expectedRemaining {
-			t.Errorf("expected remaining %d, got %d", expectedRemaining, remaining)
-		}
-	}
-
-	// 4th pick should cycle and still succeed
-	p, remaining, _, ok := cache.PickNext(sessionID)
-	if !ok || p == nil {
-		t.Fatalf("expected cycle pick to succeed")
-	}
-	if remaining != 2 {
-		t.Errorf("expected remaining after cycle reset to be 2, got %d", remaining)
-	}
-}
-
-func TestLotteryServiceDrawAndFallback(t *testing.T) {
+func TestCoordinatePairRequirement(t *testing.T) {
 	repo := newMockRepo()
-	mapsClient := &mockMapsClient{
-		places: []googlemaps.Place{
-			{ID: "p1", DisplayName: googlemaps.LocalizedText{Text: "測試餐廳"}},
-		},
-	}
-
-	svc := NewService(repo, mapsClient)
+	client := &mockMapsClient{}
+	svc := NewService(repo, client)
 	defer svc.Close()
 
 	ctx := context.Background()
 
-	// 1. 尚未設定偏好時呼叫 Draw (無即時坐標) -> 應回傳 ErrNoPreference
-	_, err := svc.Draw(ctx, DrawRequest{UserID: "user123"})
-	if err != ErrNoPreference {
-		t.Fatalf("expected ErrNoPreference, got %v", err)
+	// 1. 僅提供 latitude，未提供 longitude
+	_, err := svc.Draw(ctx, DrawRequest{
+		UserID:   "u1",
+		Latitude: floatPtr(25.0339),
+	})
+	if err != ErrCoordinatePairRequired {
+		t.Errorf("expected ErrCoordinatePairRequired when only lat provided, got %v", err)
 	}
 
-	// 2. 設定使用者偏好
-	err = svc.SetPreference(ctx, "user123", "公司", 25.0339, 121.5644, 1000)
-	if err != nil {
-		t.Fatalf("SetPreference failed: %v", err)
+	// 2. 僅提供 longitude，未提供 latitude
+	_, err = svc.Draw(ctx, DrawRequest{
+		UserID:    "u1",
+		Longitude: floatPtr(121.5644),
+	})
+	if err != ErrCoordinatePairRequired {
+		t.Errorf("expected ErrCoordinatePairRequired when only lng provided, got %v", err)
 	}
+}
 
-	// 3. 再次抽籤 -> 成功取得偏好位置並完成抽籤
-	res, err := svc.Draw(ctx, DrawRequest{UserID: "user123"})
+func TestPrivacy_LocationNameNeverExposed(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{
+		places: []googlemaps.Place{
+			{ID: "p1", DisplayName: googlemaps.LocalizedText{Text: "巷口麵店"}},
+		},
+	}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	// 使用者將位置別名設定為「我家私密住址」
+	_ = svc.SetPreference(ctx, "user-privacy", "我家私密住址", 25.0339, 121.5644, 1000)
+
+	// 使用預設偏好抽籤
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "user-privacy"})
 	if err != nil {
 		t.Fatalf("Draw failed: %v", err)
 	}
-	if res.Place.DisplayName.Text != "測試餐廳" {
-		t.Errorf("expected 測試餐廳, got %s", res.Place.DisplayName.Text)
+
+	// 公開抽籤結果之 LocationName 絕對不得出現使用者自訂的「我家私密住址」
+	if res.QueryCtx.LocationName == "我家私密住址" {
+		t.Fatalf("CRITICAL: Private location name leaked in DrawResult.QueryCtx: %s", res.QueryCtx.LocationName)
 	}
-	if res.QueryCtx.LocationName != "公司" {
-		t.Errorf("expected location name 公司, got %s", res.QueryCtx.LocationName)
+	if res.QueryCtx.LocationName != "預設位置" {
+		t.Errorf("expected LocationName to be '預設位置', got '%s'", res.QueryCtx.LocationName)
 	}
+}
+
+func TestLotteryService_EmptyPlaces(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{places: []googlemaps.Place{}}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+
+	_, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
+	if err != ErrNoRestaurants {
+		t.Fatalf("expected ErrNoRestaurants for empty places, got %v", err)
+	}
+}
+
+func TestLotteryService_OnePlaceAndExhaustion(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{
+		places: []googlemaps.Place{
+			{ID: "single-1", DisplayName: googlemaps.LocalizedText{Text: "唯一餐廳"}},
+		},
+	}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	if res.Place.ID != "single-1" {
+		t.Errorf("expected single-1, got %s", res.Place.ID)
+	}
+	if res.RemainingCount != 0 {
+		t.Errorf("expected 0 remaining, got %d", res.RemainingCount)
+	}
+
+	// 嘗試 Reroll，此時候選已空，應回傳 ErrNoMoreCandidates
+	_, err = svc.Reroll(ctx, res.SessionID)
+	if err != ErrNoMoreCandidates {
+		t.Fatalf("expected ErrNoMoreCandidates on exhausted session, got %v", err)
+	}
+}
+
+func TestLotteryService_MultiplePlacesAndRerollSequence(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{
+		places: []googlemaps.Place{
+			{ID: "p1", DisplayName: googlemaps.LocalizedText{Text: "餐廳 1"}},
+			{ID: "p2", DisplayName: googlemaps.LocalizedText{Text: "餐廳 2"}},
+			{ID: "p3", DisplayName: googlemaps.LocalizedText{Text: "餐廳 3"}},
+		},
+	}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+
+	res1, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	if res1.RemainingCount != 2 {
+		t.Errorf("expected remaining 2, got %d", res1.RemainingCount)
+	}
+
+	res2, err := svc.Reroll(ctx, res1.SessionID)
+	if err != nil {
+		t.Fatalf("Reroll 1 failed: %v", err)
+	}
+	if res2.Place.ID == res1.Place.ID {
+		t.Errorf("Reroll returned duplicate place: %s", res2.Place.ID)
+	}
+	if res2.RemainingCount != 1 {
+		t.Errorf("expected remaining 1, got %d", res2.RemainingCount)
+	}
+
+	res3, err := svc.Reroll(ctx, res1.SessionID)
+	if err != nil {
+		t.Fatalf("Reroll 2 failed: %v", err)
+	}
+	if res3.Place.ID == res1.Place.ID || res3.Place.ID == res2.Place.ID {
+		t.Errorf("Reroll returned duplicate place: %s", res3.Place.ID)
+	}
+	if res3.RemainingCount != 0 {
+		t.Errorf("expected remaining 0, got %d", res3.RemainingCount)
+	}
+
+	// 第 4 次 Reroll: 候選全部用罄
+	_, err = svc.Reroll(ctx, res1.SessionID)
+	if err != ErrNoMoreCandidates {
+		t.Errorf("expected ErrNoMoreCandidates, got %v", err)
+	}
+}
+
+func TestLotteryService_DuplicatePlaceIDs(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{
+		places: []googlemaps.Place{
+			{ID: "dup-1", DisplayName: googlemaps.LocalizedText{Text: "重複餐廳 1"}},
+			{ID: "dup-1", DisplayName: googlemaps.LocalizedText{Text: "重複餐廳 1 複本"}},
+			{ID: "p2", DisplayName: googlemaps.LocalizedText{Text: "餐廳 2"}},
+		},
+	}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+
+	// 確保後續抽取仍然正常終止，不會死循環
+	for i := 0; i < 5; i++ {
+		_, _ = svc.Reroll(ctx, res.SessionID)
+	}
+}
+
+func TestLotteryService_ExpiredSession(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{
+		places: []googlemaps.Place{
+			{ID: "p1", DisplayName: googlemaps.LocalizedText{Text: "餐廳 1"}},
+		},
+	}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	_, err := svc.Reroll(ctx, "non-existent-session-id")
+	if err != ErrSessionExpired {
+		t.Errorf("expected ErrSessionExpired for non-existent session, got %v", err)
+	}
+}
+
+func TestLotteryService_ConcurrentPickNext(t *testing.T) {
+	repo := newMockRepo()
+	var places []googlemaps.Place
+	for i := 0; i < 50; i++ {
+		places = append(places, googlemaps.Place{
+			ID:          string(rune('A' + i)),
+			DisplayName: googlemaps.LocalizedText{Text: "餐廳"},
+		})
+	}
+	client := &mockMapsClient{places: places}
+	svc := NewService(repo, client)
+	defer svc.Close()
+
+	ctx := context.Background()
+	res, err := svc.Draw(ctx, DrawRequest{
+		Latitude:  floatPtr(25.0339),
+		Longitude: floatPtr(121.5644),
+	})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const workers = 30
+	wg.Add(workers)
+
+	pickedIDs := sync.Map{}
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			r, err := svc.Reroll(ctx, res.SessionID)
+			if err == nil && r != nil && r.Place != nil {
+				if _, loaded := pickedIDs.LoadOrStore(r.Place.ID, true); loaded {
+					t.Errorf("duplicate place picked in concurrent reroll: %s", r.Place.ID)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }

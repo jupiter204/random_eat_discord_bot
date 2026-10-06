@@ -41,7 +41,7 @@ func RenderDrawEmbed(res *lottery.DrawResult) (*discordgo.MessageEmbed, []discor
 		},
 		{
 			Name: "🎯 搜尋條件",
-			Value: fmt.Sprintf("中心：%s\n半徑：%d 公尺%s",
+			Value: fmt.Sprintf("搜尋中心：%s\n搜尋範圍：半徑 %d 公尺%s",
 				res.QueryCtx.LocationName,
 				res.QueryCtx.Radius,
 				func() string {
@@ -71,14 +71,20 @@ func RenderDrawEmbed(res *lottery.DrawResult) (*discordgo.MessageEmbed, []discor
 		},
 	}
 
+	rerollBtn := discordgo.Button{
+		Label:    "🔄 再抽一家 (不消耗 API)",
+		Style:    discordgo.PrimaryButton,
+		CustomID: fmt.Sprintf("reroll:%s", res.SessionID),
+	}
+	if res.RemainingCount == 0 {
+		rerollBtn.Disabled = true
+		rerollBtn.Label = "已無更多備選餐廳"
+	}
+
 	components := []discordgo.MessageComponent{
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
-				discordgo.Button{
-					Label:    "🔄 再抽一家 (不消耗 API)",
-					Style:    discordgo.PrimaryButton,
-					CustomID: fmt.Sprintf("reroll:%s", res.SessionID),
-				},
+				rerollBtn,
 			},
 		},
 	}

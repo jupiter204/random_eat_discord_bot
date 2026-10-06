@@ -1,6 +1,7 @@
 package googlemaps
 
 import (
+	"math"
 	"strings"
 	"time"
 )
@@ -19,17 +20,25 @@ type OpeningHours struct {
 	NextCloseTime       string   `json:"nextCloseTime,omitempty"`
 }
 
+// TimeZone 代表 Google Places API 的時區結構
+type TimeZone struct {
+	ID string `json:"id,omitempty"`
+}
+
 // Place 代表 Places API (New) 回傳的餐廳資料結構
 type Place struct {
 	ID                  string        `json:"id"`
 	DisplayName         LocalizedText `json:"displayName"`
 	FormattedAddress    string        `json:"formattedAddress"`
+	Location            *LatLng       `json:"location,omitempty"`
 	Rating              float64       `json:"rating,omitempty"`
 	UserRatingCount     int           `json:"userRatingCount,omitempty"`
 	GoogleMapsURI       string        `json:"googleMapsUri"`
 	PriceLevel          string        `json:"priceLevel,omitempty"`
 	CurrentOpeningHours *OpeningHours `json:"currentOpeningHours,omitempty"`
 	RegularOpeningHours *OpeningHours `json:"regularOpeningHours,omitempty"`
+	UTCOffsetMinutes    *int          `json:"utcOffsetMinutes,omitempty"`
+	TimeZone            *TimeZone     `json:"timeZone,omitempty"`
 }
 
 // FormattedPriceLevel 將 Google 價位列舉轉換為簡潔易讀符號
@@ -50,7 +59,7 @@ func (p *Place) FormattedPriceLevel() string {
 	}
 }
 
-// IsOpenNow 判斷店家目前是否正在營業
+// IsOpenNow 判斷店家目前是否正在營業（僅接受明確為 true，未知或無資料皆視為 false）
 func (p *Place) IsOpenNow() bool {
 	if p.CurrentOpeningHours != nil && p.CurrentOpeningHours.OpenNow != nil {
 		return *p.CurrentOpeningHours.OpenNow
@@ -91,7 +100,20 @@ func (p *Place) OpenStatusText() string {
 	return "休息中 🔴"
 }
 
-// TodayOpeningHours 取得今日的營業時間描述
+// LocationTimezone 取得 Place 所在地的時區（優先使用 timeZone.id，次之 utcOffsetMinutes，fallback 至 local）
+func (p *Place) LocationTimezone() *time.Location {
+	if p.TimeZone != nil && p.TimeZone.ID != "" {
+		if loc, err := time.LoadLocation(p.TimeZone.ID); err == nil {
+			return loc
+		}
+	}
+	if p.UTCOffsetMinutes != nil {
+		return time.FixedZone("", (*p.UTCOffsetMinutes)*60)
+	}
+	return time.Local
+}
+
+// TodayOpeningHours 取得今日的營業時間描述（根據店家所在地時區計算今日星期）
 func (p *Place) TodayOpeningHours() string {
 	var hours *OpeningHours
 	if p.CurrentOpeningHours != nil {
@@ -104,11 +126,7 @@ func (p *Place) TodayOpeningHours() string {
 		return "未提供營業時間"
 	}
 
-	// 載入台北時區以對應今日星期
-	loc, err := time.LoadLocation("Asia/Taipei")
-	if err != nil {
-		loc = time.FixedZone("CST", 8*3600)
-	}
+	loc := p.LocationTimezone()
 	todayWeekday := time.Now().In(loc).Weekday()
 
 	weekdayPrefixes := map[time.Weekday][]string{
@@ -132,6 +150,37 @@ func (p *Place) TodayOpeningHours() string {
 
 	// 若未匹配前綴，回傳第一筆
 	return hours.WeekdayDescriptions[0]
+}
+
+// Haversine 計算地球表面兩坐標點間的大圓距離（公尺）
+func Haversine(lat1, lon1, lat2, lon2 float64) float64 {
+	const earthRadius = 6371000.0 // 地球平均半徑（公尺）
+	dLat := (lat2 - lat1) * (math.Pi / 180.0)
+	dLon := (lon2 - lon1) * (math.Pi / 180.0)
+
+	rLat1 := lat1 * (math.Pi / 180.0)
+	rLat2 := lat2 * (math.Pi / 180.0)
+
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(rLat1)*math.Cos(rLat2)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	return earthRadius * c
+}
+
+// FilterByRadius 依據傳入中心坐標與半徑（公尺）過濾店家
+func FilterByRadius(places []Place, centerLat, centerLng float64, radiusMeters int) []Place {
+	filtered := make([]Place, 0, len(places))
+	maxDist := float64(radiusMeters)
+	for _, p := range places {
+		if p.Location != nil {
+			dist := Haversine(centerLat, centerLng, p.Location.Latitude, p.Location.Longitude)
+			if dist <= maxDist {
+				filtered = append(filtered, p)
+			}
+		}
+	}
+	return filtered
 }
 
 // LatLng 代表經緯度坐標
@@ -159,16 +208,18 @@ type LocationBias struct {
 // NearbySearchRequest Places API (New) searchNearby 請求
 type NearbySearchRequest struct {
 	IncludedTypes       []string            `json:"includedTypes"`
-	MaxResultCount      int                 `json:"maxResultCount"`
+	OpenNow             bool                `json:"openNow,omitempty"`
+	MaxResultCount      int                 `json:"maxResultCount,omitempty"`
 	LocationRestriction LocationRestriction `json:"locationRestriction"`
 }
 
 // TextSearchRequest Places API (New) searchText 請求
 type TextSearchRequest struct {
-	TextQuery    string       `json:"textQuery"`
-	IncludedType string       `json:"includedType,omitempty"`
-	OpenNow      bool         `json:"openNow"`
-	LocationBias LocationBias `json:"locationBias"`
+	TextQuery           string       `json:"textQuery"`
+	IncludedType        string       `json:"includedType,omitempty"`
+	StrictTypeFiltering bool         `json:"strictTypeFiltering,omitempty"`
+	OpenNow             bool         `json:"openNow"`
+	LocationBias        LocationBias `json:"locationBias"`
 }
 
 // PlacesResponse Places API 統一回傳格式

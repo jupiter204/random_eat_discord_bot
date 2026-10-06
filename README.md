@@ -7,14 +7,24 @@
 ## ✨ 核心特色
 
 - 🚀 **超低資源消耗**：純 Go 實作（無 CGO 依賴），SQLite 採用單連線與記憶體限制最佳化，常駐記憶體僅約 **5~10 MB**。
-- 💸 **極致節省 API 費用**：
+- 💸 **API 呼叫與成本最佳化**：
     - **純座標定位**：使用者直接輸入經緯度，省去 Geocoding 地址轉換費用。
-    - **批次暫存與重抽機制**：每次查詢最多獲取 20 家營業中餐廳並快取於記憶體（10 分鐘 TTL），點擊按鈕重抽**完全不消耗 Google API 額度**。
-    - **嚴格欄位遮罩 (Field Mask)**：僅請求必要欄位，控管 Places API 呼叫成本。
-- 🕔 **營業狀態保證**：預設僅過濾並回傳**當前營業中**的店家，避免抽到打烊餐廳。
-- 🔒 **隱私防護**：`/set` 個人位置設定採用 **Ephemeral（私密訊息）**，保護住家/公司地址隱私。
+    - **單次搜尋與 Session 快取**：初次搜尋批次取得候選餐廳並快取於記憶體（10 分鐘 TTL），「🔄 再抽一家」完全於記憶體挑選，**不重新呼叫 Google API**。
+    - **欄位遮罩 (Field Mask)**：使用精確的 Field Mask 控管 Places API 回傳欄位。
+- 🕔 **明確營業中過濾**：僅接受 Google Places API 明確標示目前營業中的餐廳；營業狀態未知的店家會排除。
+- 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應。
+- 🎯 **嚴格搜尋半徑**：
+    - 無關鍵字時使用 `searchNearby` 與 `locationRestriction` 圓形區域限制。
+    - 關鍵字搜尋使用 `searchText` 搭配 `restaurant` 嚴格類別過濾（`strictTypeFiltering`），並於後端以 Haversine 大圓距離公式進行嚴格過濾，保證最終回傳餐廳不超過指定半徑。
+- 🔒 **隱私防護**：
+    - `/set` 個人位置設定採用 **Ephemeral（私密訊息）**。
+    - `/eat` 公開卡片僅顯示「預設位置」或「指定坐標」，絕不顯示使用者自訂的私人別名（如「我家」、「宿舍」），保護個人隱私。
+- 👥 **頻道共同決策 Reroll**：
+    - 抽籤卡片上的「再抽一家」採頻道共同決策模式，頻道內任何可見成員皆可點擊參與。
+    - 候選名單抽完即止，不無限循環重複先前出現過的店家；抽完後按鈕自動停用。
+- 🔄 **健全重試機制**：API Client 內建 10 秒連線超時與針對 429、5xx 暫態錯誤的指數退避重試（最多 2 次）。
 - ⚡ **防 3 秒逾時機制**：完整支援 Discord Deferred Interaction，避免網路延遲導致指令失效。
-- 🐳 **容器化設計**：專為 **Podman / Docker** 打造，提供 Rootless 與 SELinux `:Z` 支援。
+- 🐳 **容器化設計**：專為 **Podman / Docker** 打造，使用 multi-stage build 與 Alpine runtime image 降低部署映像檔大小，提供 Rootless 與 SELinux `:Z` 支援。
 
 ---
 
@@ -24,7 +34,7 @@
 - **Discord SDK**：[`bwmarrin/discordgo`](https://github.com/bwmarrin/discordgo)
 - **資料持久化**：[`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite)（純 Go 驅動，跨平台、零 CGO）
 - **地理資訊服務**：Google Places API (New)（`searchNearby` & `searchText`）
-- **容器環境**：Podman / Docker（基於 Alpine Linux，映像檔體積 < 25MB）
+- **容器環境**：Podman / Docker（基於 Alpine Linux runtime）
 
 ---
 
@@ -33,8 +43,10 @@
 | 指令    | 說明                             | 參數                                                                                                                                                     | 回應模式                 |
 | :------ | :------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- |
 | `/set`  | 設定個人的預設搜尋座標與半徑     | `latitude` (必填/緯度)<br>`longitude` (必填/經度)<br>`radius` (選填/搜尋半徑公尺，預設 1000m)<br>`name` (選填/位置別名，如「公司」)                      | 🔒 私密訊息 (僅自己可見) |
-| `/eat`  | 隨機抽取營業中的餐廳             | `keyword` (選填/指定餐點種類，如「拉麵」、「火鍋」)<br>`latitude` (選填/覆蓋預設緯度)<br>`longitude` (選填/覆蓋預設經度)<br>`radius` (選填/覆蓋預設半徑) | 📢 公開頻道訊息          |
+| `/eat`  | 隨機抽取營業中的餐廳             | `keyword` (選填/指定餐點種類，如「拉麵」、「火鍋」)<br>`latitude` (選填/臨時指定緯度)<br>`longitude` (選填/臨時指定經度)<br>`radius` (選填/覆蓋預設半徑)     | 📢 公開頻道訊息          |
 | `/help` | 查看機器人功能教學與座標取得方式 | 無                                                                                                                                                       | 🔒 私密訊息              |
+
+> ⚠️ **坐標輸入注意**：在 `/eat` 中若要自訂坐標，`latitude` 與 `longitude` 必須成對提供；若皆未提供則自動套用 `/set` 儲存的個人預設位置。
 
 > 💡 **如何取得經緯度座標？**  
 > 打開 Google 地圖 App 或網頁版，在目標位置**長按**（或按右鍵），即可一鍵複製如 `25.0339, 121.5644` 的經緯度座標。
@@ -141,23 +153,29 @@ random_eat_discord/
 │   │   ├── models.go              # UserPreference 資料模型
 │   │   └── repository.go          # 使用者偏好 CRUD 實作
 │   ├── googlemaps/
-│   │   ├── client.go              # Places API (New) HTTP Client 封裝
-│   │   └── models.go              # Places API 請求/回應與價位轉換模型
+│   │   ├── client.go              # Places API (New) searchNearby / searchText 與重試機制
+│   │   ├── client_test.go         # API Client 單元與 Mock 測試
+│   │   ├── models.go              # Places API 資料結構、時區解析與 Haversine 距離過濾
+│   │   └── models_test.go         # 資料模型與營業狀態測試
 │   ├── lottery/
-│   │   ├── service.go             # 抽籤核心邏輯、座標驗證、Fallback 流程
-│   │   ├── service_test.go        # 抽籤邏輯單元測試
-│   │   └── session_cache.go       # 候選清單記憶體快取 (TTL 10m、重抽排重)
+│   │   ├── service.go             # 抽籤核心邏輯、成對坐標驗證、隱私保護
+│   │   ├── service_test.go        # 抽籤核心流程單元測試
+│   │   ├── session_cache.go       # 候選清單記憶體快取 (TTL 10m、非循環排重)
+│   │   └── session_cache_test.go  # 快取並行、TTL 與排重測試
 │   └── discord/
 │       ├── bot.go                 # Discordgo 連線與 Slash Command 註冊
 │       ├── commands.go            # /set, /eat, /help 指令規格定義
 │       ├── handlers.go            # Interaction 路由與按鈕互動事件處理
-│       └── views.go               # Discord Rich Embed 訊息卡片排版
+│       ├── views.go               # Discord Rich Embed 訊息卡片排版
+│       └── views_test.go          # 卡片渲染與按鈕狀態測試
 ├── data/                          # SQLite 資料庫儲存目錄 (.gitignore)
 ├── Dockerfile                     # 多階段輕量容器建置檔
 ├── compose.yaml                   # 生產環境 Podman Compose 設定
 ├── compose.dev.yaml               # 開發環境容器設定
 ├── SPEC.md                        # 詳細系統規格書
-├── PLAN.md                        # 開發實作計畫書
+├── PLAN.md                        # 專案發展藍圖 (Roadmap)
+├── discord.md                     # Discord 指令與互動規格
+├── LICENSE                        # MIT License
 └── README.md                      # 本說明文件
 ```
 
@@ -165,10 +183,16 @@ random_eat_discord/
 
 ## 🧪 測試
 
+本機執行單元測試與並行檢測：
+
+```bash
+go test -race -v ./...
+```
+
 在容器內執行單元測試：
 
 ```bash
-podman run --rm -v "$PWD":/app:Z -w /app golang:1.24-alpine go test -v ./...
+podman run --rm -v "$PWD":/app:Z -w /app golang:1.24-alpine go test -race -v ./...
 ```
 
 ---
