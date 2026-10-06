@@ -3,6 +3,7 @@ package googlemaps
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,11 +12,12 @@ import (
 	"time"
 )
 
-func TestClient_SearchNearbyRestaurants_Success(t *testing.T) {
+func TestClient_SearchNearbyRestaurants_RequestContractAndSuccess(t *testing.T) {
 	var capturedPath string
 	var capturedAPIKey string
 	var capturedFieldMask string
 	var capturedLang string
+	var capturedRawBody map[string]any
 	var capturedReq NearbySearchRequest
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,7 +26,18 @@ func TestClient_SearchNearbyRestaurants_Success(t *testing.T) {
 		capturedFieldMask = r.Header.Get("X-Goog-FieldMask")
 		capturedLang = r.Header.Get("X-Goog-Language-Code")
 
-		_ = json.NewDecoder(r.Body).Decode(&capturedReq)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read body: %v", err)
+		}
+
+		// 解析原始 JSON 以驗證欄位合約
+		if err := json.Unmarshal(bodyBytes, &capturedRawBody); err != nil {
+			t.Fatalf("failed to unmarshal raw body: %v", err)
+		}
+		if err := json.Unmarshal(bodyBytes, &capturedReq); err != nil {
+			t.Fatalf("failed to unmarshal request: %v", err)
+		}
 
 		resp := PlacesResponse{
 			Places: []Place{
@@ -68,25 +81,30 @@ func TestClient_SearchNearbyRestaurants_Success(t *testing.T) {
 	if capturedAPIKey != "test-key-123" {
 		t.Errorf("expected API Key test-key-123, got %s", capturedAPIKey)
 	}
-	if !strings.Contains(capturedFieldMask, "places.location") || !strings.Contains(capturedFieldMask, "places.id") {
-		t.Errorf("expected field mask with location and id, got %s", capturedFieldMask)
+	if !strings.Contains(capturedFieldMask, "places.location") || !strings.Contains(capturedFieldMask, "places.currentOpeningHours") {
+		t.Errorf("expected field mask with location and currentOpeningHours, got %s", capturedFieldMask)
 	}
 	if capturedLang != "zh-TW" {
 		t.Errorf("expected language zh-TW, got %s", capturedLang)
 	}
 
-	// 驗證 Request Body
+	// 【關鍵合約測試】：確認 Nearby Search request body 絕不包含 openNow
+	if _, exists := capturedRawBody["openNow"]; exists {
+		t.Fatal("Nearby Search request must not contain openNow parameter")
+	}
+
+	// 驗證 Request Body 其他必要合約欄位
 	if len(capturedReq.IncludedTypes) != 1 || capturedReq.IncludedTypes[0] != "restaurant" {
 		t.Errorf("expected includedTypes [restaurant], got %v", capturedReq.IncludedTypes)
 	}
-	if !capturedReq.OpenNow {
-		t.Errorf("expected OpenNow true")
+	if capturedReq.MaxResultCount != 20 {
+		t.Errorf("expected maxResultCount 20, got %d", capturedReq.MaxResultCount)
 	}
 	if capturedReq.LocationRestriction.Circle.Radius != 1000 {
 		t.Errorf("expected radius 1000, got %v", capturedReq.LocationRestriction.Circle.Radius)
 	}
 
-	// 驗證過濾結果：只應保留營業中且在 1000m 內的 place-nearby-1
+	// 驗證應用層過濾結果：只應保留營業中且在 1000m 內的 place-nearby-1
 	if len(places) != 1 {
 		t.Fatalf("expected 1 filtered place, got %d", len(places))
 	}
@@ -95,33 +113,50 @@ func TestClient_SearchNearbyRestaurants_Success(t *testing.T) {
 	}
 }
 
-func TestClient_SearchTextRestaurants_Success(t *testing.T) {
-	var capturedPath string
-	var capturedReq TextSearchRequest
+func TestClient_SearchTextRestaurants_ContractAndPagination(t *testing.T) {
+	var requestCount int32
+	var page1Req TextSearchRequest
+	var page2Req TextSearchRequest
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedPath = r.URL.Path
-		_ = json.NewDecoder(r.Body).Decode(&capturedReq)
+		count := atomic.AddInt32(&requestCount, 1)
 
-		resp := PlacesResponse{
-			Places: []Place{
-				{
-					ID:                  "place-text-1",
-					DisplayName:         LocalizedText{Text: "一蘭拉麵"},
-					Location:            &LatLng{Latitude: 25.0340, Longitude: 121.5645}, // 距離近
-					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+		if count == 1 {
+			_ = json.NewDecoder(r.Body).Decode(&page1Req)
+			// 第 1 頁：回傳 1 間距離過遠 (>1000m) 的餐廳，並附帶 nextPageToken
+			resp := PlacesResponse{
+				Places: []Place{
+					{
+						ID:                  "place-page1-far",
+						DisplayName:         LocalizedText{Text: "遠方拉麵"},
+						Location:            &LatLng{Latitude: 25.1000, Longitude: 121.5645}, // 遠超 1000m
+						CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+					},
 				},
-				{
-					ID:                  "place-text-far",
-					DisplayName:         LocalizedText{Text: "花蓮拉麵"},
-					Location:            &LatLng{Latitude: 23.9750, Longitude: 121.6050}, // 遠在花蓮
-					CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
-				},
-			},
+				NextPageToken: "token-page-2",
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		if count == 2 {
+			_ = json.NewDecoder(r.Body).Decode(&page2Req)
+			// 第 2 頁：回傳 1 間距離近 (<1000m) 的餐廳
+			resp := PlacesResponse{
+				Places: []Place{
+					{
+						ID:                  "place-page2-close",
+						DisplayName:         LocalizedText{Text: "近處拉麵"},
+						Location:            &LatLng{Latitude: 25.0340, Longitude: 121.5645}, // 距離極近 (~10m)
+						CurrentOpeningHours: &OpeningHours{OpenNow: boolPtr(true)},
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
 	}))
 	defer server.Close()
 
@@ -132,25 +167,31 @@ func TestClient_SearchTextRestaurants_Success(t *testing.T) {
 		t.Fatalf("SearchTextRestaurants failed: %v", err)
 	}
 
-	if capturedPath != "/v1/places:searchText" {
-		t.Errorf("expected path /v1/places:searchText, got %s", capturedPath)
+	// 驗證第 1 頁合約
+	if page1Req.TextQuery != "拉麵" {
+		t.Errorf("expected textQuery '拉麵', got %s", page1Req.TextQuery)
 	}
-	if capturedReq.TextQuery != "拉麵" {
-		t.Errorf("expected textQuery '拉麵', got %s", capturedReq.TextQuery)
+	if page1Req.IncludedType != "restaurant" {
+		t.Errorf("expected includedType 'restaurant', got %s", page1Req.IncludedType)
 	}
-	if capturedReq.IncludedType != "restaurant" {
-		t.Errorf("expected includedType 'restaurant', got %s", capturedReq.IncludedType)
-	}
-	if !capturedReq.StrictTypeFiltering {
+	if !page1Req.StrictTypeFiltering {
 		t.Errorf("expected StrictTypeFiltering true")
 	}
-
-	// 驗證花蓮拉麵已被 Haversine 半徑過濾排除
-	if len(places) != 1 {
-		t.Fatalf("expected 1 place, got %d", len(places))
+	if !page1Req.OpenNow {
+		t.Errorf("expected OpenNow true in TextSearchRequest")
 	}
-	if places[0].ID != "place-text-1" {
-		t.Errorf("expected place-text-1, got %s", places[0].ID)
+
+	// 驗證分頁：由於第 1 頁在 1000m 內為 0 筆，client 應自動查詢第 2 頁
+	if atomic.LoadInt32(&requestCount) != 2 {
+		t.Errorf("expected 2 requests for pagination, got %d", requestCount)
+	}
+	if page2Req.PageToken != "token-page-2" {
+		t.Errorf("expected page2 pageToken 'token-page-2', got %s", page2Req.PageToken)
+	}
+
+	// 驗證最終結果為第 2 頁篩選出的餐廳
+	if len(places) != 1 || places[0].ID != "place-page2-close" {
+		t.Fatalf("expected place-page2-close, got %+v", places)
 	}
 }
 

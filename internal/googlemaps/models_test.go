@@ -40,19 +40,10 @@ func TestPlace_IsOpenNow(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "RegularOpeningHours Open fallback",
+			name: "RegularOpeningHours only does not indicate real-time open",
 			place: Place{
 				RegularOpeningHours: &OpeningHours{
 					OpenNow: boolPtr(true),
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "RegularOpeningHours Closed fallback",
-			place: Place{
-				RegularOpeningHours: &OpeningHours{
-					OpenNow: boolPtr(false),
 				},
 			},
 			expected: false,
@@ -99,10 +90,10 @@ func TestFilterOpenPlaces(t *testing.T) {
 	}
 
 	filtered := FilterOpenPlaces(places)
-	if len(filtered) != 2 {
-		t.Fatalf("expected 2 open places, got %d", len(filtered))
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 open place (p1), got %d", len(filtered))
 	}
-	if filtered[0].ID != "p1" || filtered[1].ID != "p3" {
+	if filtered[0].ID != "p1" {
 		t.Errorf("unexpected filtered places: %+v", filtered)
 	}
 }
@@ -132,15 +123,6 @@ func TestPlace_OpenStatusText(t *testing.T) {
 			expected: "休息中 🔴",
 		},
 		{
-			name: "RegularOpeningHours Open fallback",
-			place: Place{
-				RegularOpeningHours: &OpeningHours{
-					OpenNow: boolPtr(true),
-				},
-			},
-			expected: "營業中 🟢",
-		},
-		{
 			name:     "Nil hours",
 			place:    Place{},
 			expected: "營業狀態未知 ⚪",
@@ -158,26 +140,40 @@ func TestPlace_OpenStatusText(t *testing.T) {
 }
 
 func TestPlace_LocationTimezone(t *testing.T) {
-	// 1. TimeZone ID 設定
-	p1 := Place{TimeZone: &TimeZone{ID: "America/New_York"}}
-	loc1 := p1.LocationTimezone()
-	if loc1.String() != "America/New_York" {
-		t.Errorf("expected America/New_York, got %s", loc1.String())
+	// 1. TimeZone ID: Asia/Taipei
+	pTaipei := Place{TimeZone: &TimeZone{ID: "Asia/Taipei"}}
+	locTaipei := pTaipei.LocationTimezone()
+	if locTaipei.String() != "Asia/Taipei" {
+		t.Errorf("expected Asia/Taipei, got %s", locTaipei.String())
 	}
 
-	// 2. UTCOffsetMinutes 設定 (+540 = +9h Tokyo)
-	p2 := Place{UTCOffsetMinutes: intPtr(540)}
-	loc2 := p2.LocationTimezone()
-	_, offset2 := time.Now().In(loc2).Zone()
+	// 2. TimeZone ID: America/New_York
+	pNY := Place{TimeZone: &TimeZone{ID: "America/New_York"}}
+	locNY := pNY.LocationTimezone()
+	if locNY.String() != "America/New_York" {
+		t.Errorf("expected America/New_York, got %s", locNY.String())
+	}
+
+	// 3. TimeZone ID: Europe/London
+	pLondon := Place{TimeZone: &TimeZone{ID: "Europe/London"}}
+	locLondon := pLondon.LocationTimezone()
+	if locLondon.String() != "Europe/London" {
+		t.Errorf("expected Europe/London, got %s", locLondon.String())
+	}
+
+	// 4. UTCOffsetMinutes 設定 (+540 = +9h Tokyo)
+	pOffset := Place{UTCOffsetMinutes: intPtr(540)}
+	locOffset := pOffset.LocationTimezone()
+	_, offset2 := time.Now().In(locOffset).Zone()
 	if offset2 != 540*60 {
 		t.Errorf("expected offset %d, got %d", 540*60, offset2)
 	}
 
-	// 3. 兩者皆無時 fallback 到 time.Local
-	p3 := Place{}
-	loc3 := p3.LocationTimezone()
-	if loc3 != time.Local {
-		t.Errorf("expected time.Local fallback, got %v", loc3)
+	// 5. 兩者皆無時 fallback 到 time.Local
+	pFallback := Place{}
+	locFallback := pFallback.LocationTimezone()
+	if locFallback != time.Local {
+		t.Errorf("expected time.Local fallback, got %v", locFallback)
 	}
 }
 
@@ -192,25 +188,23 @@ func TestPlace_TodayOpeningHours(t *testing.T) {
 		"星期六: 11:00 – 22:00",
 	}
 
-	p := Place{
+	weekdayNames := []string{"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}
+
+	// 測試 Asia/Taipei
+	taipeiLoc, _ := time.LoadLocation("Asia/Taipei")
+	taipeiWeekday := time.Now().In(taipeiLoc).Weekday()
+	taipeiPlace := Place{
 		TimeZone: &TimeZone{ID: "Asia/Taipei"},
 		CurrentOpeningHours: &OpeningHours{
 			WeekdayDescriptions: descriptions,
 		},
 	}
-
-	got := p.TodayOpeningHours()
-	if got == "" || got == "未提供營業時間" {
-		t.Errorf("expected opening hours, got: %s", got)
+	taipeiHours := taipeiPlace.TodayOpeningHours()
+	if !strings.HasPrefix(taipeiHours, weekdayNames[taipeiWeekday]) {
+		t.Errorf("expected prefix %s in Taipei opening hours, got %s", weekdayNames[taipeiWeekday], taipeiHours)
 	}
 
-	// 測試空資料
-	emptyPlace := Place{}
-	if gotEmpty := emptyPlace.TodayOpeningHours(); gotEmpty != "未提供營業時間" {
-		t.Errorf("expected 未提供營業時間, got: %s", gotEmpty)
-	}
-
-	// 測試不同時區下的對應（例如跨越午夜的時區，確認 weekday 根據該時區計算）
+	// 測試 America/New_York
 	nyLoc, _ := time.LoadLocation("America/New_York")
 	nyWeekday := time.Now().In(nyLoc).Weekday()
 	nyPlace := Place{
@@ -220,10 +214,28 @@ func TestPlace_TodayOpeningHours(t *testing.T) {
 		},
 	}
 	nyHours := nyPlace.TodayOpeningHours()
-	weekdayNames := []string{"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}
-	expectedPrefix := weekdayNames[nyWeekday]
-	if !strings.HasPrefix(nyHours, expectedPrefix) {
-		t.Errorf("expected prefix %s in NY opening hours, got %s", expectedPrefix, nyHours)
+	if !strings.HasPrefix(nyHours, weekdayNames[nyWeekday]) {
+		t.Errorf("expected prefix %s in NY opening hours, got %s", weekdayNames[nyWeekday], nyHours)
+	}
+
+	// 測試 Europe/London
+	londonLoc, _ := time.LoadLocation("Europe/London")
+	londonWeekday := time.Now().In(londonLoc).Weekday()
+	londonPlace := Place{
+		TimeZone: &TimeZone{ID: "Europe/London"},
+		CurrentOpeningHours: &OpeningHours{
+			WeekdayDescriptions: descriptions,
+		},
+	}
+	londonHours := londonPlace.TodayOpeningHours()
+	if !strings.HasPrefix(londonHours, weekdayNames[londonWeekday]) {
+		t.Errorf("expected prefix %s in London opening hours, got %s", weekdayNames[londonWeekday], londonHours)
+	}
+
+	// 測試空資料
+	emptyPlace := Place{}
+	if gotEmpty := emptyPlace.TodayOpeningHours(); gotEmpty != "未提供營業時間" {
+		t.Errorf("expected 未提供營業時間, got: %s", gotEmpty)
 	}
 }
 

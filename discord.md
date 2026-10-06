@@ -86,11 +86,13 @@ Discord API 嚴格要求在 **3 秒** 內對 Interaction 請求給予回應。�
 
 - **無關鍵字搜尋**：
   - 呼叫端點：`POST /v1/places:searchNearby`
-  - 參數設定：`includedTypes: ["restaurant"]`, `openNow: true`, `locationRestriction: { circle: { center, radius } }`
+  - Request 參數：`includedTypes: ["restaurant"]`, `maxResultCount: 20`, `locationRestriction: { circle: { center, radius } }` (Request 不含 `openNow` 欄位)
+  - 營業狀態過濾：由 API 回傳 `currentOpeningHours` 後，應用層過濾 `currentOpeningHours.openNow == true`
 - **關鍵字搜尋**：
   - 呼叫端點：`POST /v1/places:searchText`
-  - 參數設定：`includedType: "restaurant"`, `strictTypeFiltering: true`, `openNow: true`, `locationBias: { circle: { center, radius } }`
+  - Request 參數：`includedType: "restaurant"`, `strictTypeFiltering: true`, `openNow: true`, `locationBias: { circle: { center, radius } }`
+  - 分頁機制：若第 1 頁半徑內候選為 0 筆且存在 `nextPageToken`，最多使用 `pageToken` 翻查至第 2 頁
 - **後端驗證與雙重過濾**：
-  - 距離保證：所有候選經由後端 Haversine 公式計算距離，保證不超出搜尋半徑。
-  - 營業中保證：僅保留明確標示為營業中之店家（排除未知與打烊）。
+  - 距離保證：無 keyword 使用 `locationRestriction` 限制，有 keyword 經由後端 Haversine 公式計算距離，保證不超出搜尋半徑。
+  - 營業中保證：僅保留明確標示為營業中之店家（`currentOpeningHours.openNow == true`；排除未知與打烊）。
   - 時區解析：依據店家回傳時區動態計算今日營業時間描述。

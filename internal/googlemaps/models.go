@@ -59,13 +59,10 @@ func (p *Place) FormattedPriceLevel() string {
 	}
 }
 
-// IsOpenNow 判斷店家目前是否正在營業（僅接受明確為 true，未知或無資料皆視為 false）
+// IsOpenNow 判斷店家目前是否正在營業（以 CurrentOpeningHours.OpenNow 為準；若無即時營業資料或非明確 true 則視為 false）
 func (p *Place) IsOpenNow() bool {
 	if p.CurrentOpeningHours != nil && p.CurrentOpeningHours.OpenNow != nil {
 		return *p.CurrentOpeningHours.OpenNow
-	}
-	if p.RegularOpeningHours != nil && p.RegularOpeningHours.OpenNow != nil {
-		return *p.RegularOpeningHours.OpenNow
 	}
 	return false
 }
@@ -83,18 +80,11 @@ func FilterOpenPlaces(places []Place) []Place {
 
 // OpenStatusText 動態判斷並回傳當前營業狀態標籤
 func (p *Place) OpenStatusText() string {
-	var hours *OpeningHours
-	if p.CurrentOpeningHours != nil {
-		hours = p.CurrentOpeningHours
-	} else if p.RegularOpeningHours != nil {
-		hours = p.RegularOpeningHours
-	}
-
-	if hours == nil || hours.OpenNow == nil {
+	if p.CurrentOpeningHours == nil || p.CurrentOpeningHours.OpenNow == nil {
 		return "營業狀態未知 ⚪"
 	}
 
-	if *hours.OpenNow {
+	if *p.CurrentOpeningHours.OpenNow {
 		return "營業中 🟢"
 	}
 	return "休息中 🔴"
@@ -205,10 +195,9 @@ type LocationBias struct {
 	Circle Circle `json:"circle"`
 }
 
-// NearbySearchRequest Places API (New) searchNearby 請求
+// NearbySearchRequest Places API (New) searchNearby 請求（不含 openNow 參數）
 type NearbySearchRequest struct {
 	IncludedTypes       []string            `json:"includedTypes"`
-	OpenNow             bool                `json:"openNow,omitempty"`
 	MaxResultCount      int                 `json:"maxResultCount,omitempty"`
 	LocationRestriction LocationRestriction `json:"locationRestriction"`
 }
@@ -219,10 +208,12 @@ type TextSearchRequest struct {
 	IncludedType        string       `json:"includedType,omitempty"`
 	StrictTypeFiltering bool         `json:"strictTypeFiltering,omitempty"`
 	OpenNow             bool         `json:"openNow"`
+	PageToken           string       `json:"pageToken,omitempty"`
 	LocationBias        LocationBias `json:"locationBias"`
 }
 
 // PlacesResponse Places API 統一回傳格式
 type PlacesResponse struct {
-	Places []Place `json:"places"`
+	Places        []Place `json:"places"`
+	NextPageToken string  `json:"nextPageToken,omitempty"`
 }

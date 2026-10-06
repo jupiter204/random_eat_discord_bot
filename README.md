@@ -9,22 +9,55 @@
 - 🚀 **超低資源消耗**：純 Go 實作（無 CGO 依賴），SQLite 採用單連線與記憶體限制最佳化，常駐記憶體僅約 **5~10 MB**。
 - 💸 **API 呼叫與成本最佳化**：
     - **純座標定位**：使用者直接輸入經緯度，省去 Geocoding 地址轉換費用。
-    - **單次搜尋與 Session 快取**：初次搜尋批次取得候選餐廳並快取於記憶體（10 分鐘 TTL），「🔄 再抽一家」完全於記憶體挑選，**不重新呼叫 Google API**。
-    - **欄位遮罩 (Field Mask)**：使用精確的 Field Mask 控管 Places API 回傳欄位。
-- 🕔 **明確營業中過濾**：僅接受 Google Places API 明確標示目前營業中的餐廳；營業狀態未知的店家會排除。
-- 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應。
-- 🎯 **嚴格搜尋半徑**：
-    - 無關鍵字時使用 `searchNearby` 與 `locationRestriction` 圓形區域限制。
-    - 關鍵字搜尋使用 `searchText` 搭配 `restaurant` 嚴格類別過濾（`strictTypeFiltering`），並於後端以 Haversine 大圓距離公式進行嚴格過濾，保證最終回傳餐廳不超過指定半徑。
+    - **單次搜尋與 Session 快取**：初次搜尋批次取得候選餐廳並快取於記憶體（10 分鐘 TTL），同一 `/eat` Session 的 Reroll 使用已取得的候選集合，**不會因每次 Reroll 再次呼叫 Google Places API**。
+    - **欄位遮罩 (Field Mask)**：使用精確的 Field Mask 控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
+- 🕔 **明確營業中過濾**：系統會使用 Google Places API 提供的 `currentOpeningHours.openNow` 判斷目前營業狀態，只保留 API 明確標示為營業中的餐廳；營業狀態未知的店家會排除。
+- 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應當地營業時間。
+- 🎯 **搜尋流程與半徑保證**：
+    - **無 keyword 搜尋**：呼叫 Nearby Search (`POST /v1/places:searchNearby`)，透過 `locationRestriction` 限制圓形區域，Request 不包含 `openNow` 欄位；由 API 回傳 `currentOpeningHours` 後在應用層過濾 `openNow == true`。
+    - **有 keyword 搜尋**：呼叫 Text Search (`POST /v1/places:searchText`)，設定 `includedType: restaurant`、`strictTypeFiltering: true`、`openNow: true` 與 `locationBias`；後端再以 Haversine 大圓距離公式進行嚴格過濾，保證最終回傳餐廳不超過指定半徑。若第 1 頁在半徑內為 0 筆，最多延伸翻查至第 2 頁，避免熱門遠端店家擠佔首頁。
+- 🎲 **客觀隨機抽選**：隨機選擇範圍是 Google Places API 搜尋並通過應用程式條件篩選後的候選集合，而非保證涵蓋指定半徑內所有餐廳。
 - 🔒 **隱私防護**：
     - `/set` 個人位置設定採用 **Ephemeral（私密訊息）**。
-    - `/eat` 公開卡片僅顯示「預設位置」或「指定坐標」，絕不顯示使用者自訂的私人別名（如「我家」、「宿舍」），保護個人隱私。
+    - 使用者儲存的位置名稱（如「公司」、「我家」）**不會顯示於公開 `/eat` 結果**，公開卡片一律標記為「預設位置」或「指定坐標」，保護個人隱私。
 - 👥 **頻道共同決策 Reroll**：
     - 抽籤卡片上的「再抽一家」採頻道共同決策模式，頻道內任何可見成員皆可點擊參與。
     - 候選名單抽完即止，不無限循環重複先前出現過的店家；抽完後按鈕自動停用。
 - 🔄 **健全重試機制**：API Client 內建 10 秒連線超時與針對 429、5xx 暫態錯誤的指數退避重試（最多 2 次）。
 - ⚡ **防 3 秒逾時機制**：完整支援 Discord Deferred Interaction，避免網路延遲導致指令失效。
 - 🐳 **容器化設計**：專為 **Podman / Docker** 打造，使用 multi-stage build 與 Alpine runtime image 降低部署映像檔大小，提供 Rootless 與 SELinux `:Z` 支援。
+
+---
+
+## 🔍 搜尋與抽選流程說明
+
+```text
+/eat
+ │
+ ├─ 無 keyword
+ │      ↓
+ │   Nearby Search (New) (POST /v1/places:searchNearby)
+ │      ↓
+ │   includedTypes: ["restaurant"], locationRestriction: circle (Request 不含 openNow)
+ │      ↓
+ │   API Response 取得 currentOpeningHours & location
+ │      ↓
+ │   應用層過濾：currentOpeningHours.openNow == true && Haversine 距離 <= radius
+ │      ↓
+ │   隨機抽取 1 家，其餘候選存入 Session Cache (10m TTL)
+ │
+ └─ 有 keyword (例如拉麵)
+        ↓
+     Text Search (New) (POST /v1/places:searchText)
+        ↓
+     includedType: "restaurant", strictTypeFiltering: true, openNow: true, locationBias
+        ↓
+     應用層過濾：currentOpeningHours.openNow == true && Haversine 距離 <= radius
+        ↓
+     (若第 1 頁半徑內候選為 0 筆且存在 nextPageToken，最多抓取至第 2 頁)
+        ↓
+     隨機抽取 1 家，其餘候選存入 Session Cache (10m TTL)
+```
 
 ---
 

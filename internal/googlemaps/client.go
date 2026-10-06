@@ -62,11 +62,11 @@ func NewTestClient(apiKey, baseURL string, maxRetries int, baseDelay time.Durati
 }
 
 // SearchNearbyRestaurants 搜尋指定坐標與半徑內營業中的餐廳 (使用 searchNearby)
+// 注意：Google Places API (New) 的 searchNearby 不支援 openNow 請求參數，營業狀態過濾由取得 currentOpeningHours 後在應用層完成
 func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]Place, error) {
 	reqBody := NearbySearchRequest{
 		IncludedTypes:  []string{"restaurant"},
 		MaxResultCount: 20,
-		OpenNow:        true,
 		LocationRestriction: LocationRestriction{
 			Circle: Circle{
 				Center: LatLng{
@@ -79,13 +79,13 @@ func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng flo
 	}
 
 	endpoint := c.baseURL + "/v1/places:searchNearby"
-	places, err := c.doPost(ctx, endpoint, reqBody)
+	resp, err := c.doPost(ctx, endpoint, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	// 確保雙重過濾：僅保留確認營業中之店家
-	openPlaces := FilterOpenPlaces(places)
+	// 確保應用層過濾：僅保留確認營業中之店家 (基於 currentOpeningHours.openNow == true)
+	openPlaces := FilterOpenPlaces(resp.Places)
 	// 嚴格半徑過濾：確保回傳店家在指定半徑內
 	return FilterByRadius(openPlaces, lat, lng, radiusMeters), nil
 }
@@ -109,15 +109,37 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 	}
 
 	endpoint := c.baseURL + "/v1/places:searchText"
-	places, err := c.doPost(ctx, endpoint, reqBody)
+	resp, err := c.doPost(ctx, endpoint, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	// 確保雙重過濾：僅保留確認營業中之店家
-	openPlaces := FilterOpenPlaces(places)
-	// 嚴格半徑過濾：Text Search 使用 locationBias，以 Haversine 距離確保不超出指定 radiusMeters
-	return FilterByRadius(openPlaces, lat, lng, radiusMeters), nil
+	// 應用層過濾：營業中與指定半徑過濾
+	openPlaces := FilterOpenPlaces(resp.Places)
+	filtered := FilterByRadius(openPlaces, lat, lng, radiusMeters)
+
+	// 若第 1 頁候選經半徑過濾後為 0 筆且存在 nextPageToken，最多抓取第 2 頁，避免因 Google API 排序將遠處店家排於首頁導致誤判無結果
+	const maxPages = 2
+	currentPage := 1
+	nextPageToken := resp.NextPageToken
+
+	for len(filtered) == 0 && nextPageToken != "" && currentPage < maxPages {
+		currentPage++
+		pageReq := reqBody
+		pageReq.PageToken = nextPageToken
+
+		pageResp, pageErr := c.doPost(ctx, endpoint, pageReq)
+		if pageErr != nil {
+			break
+		}
+
+		pageOpen := FilterOpenPlaces(pageResp.Places)
+		pageFiltered := FilterByRadius(pageOpen, lat, lng, radiusMeters)
+		filtered = append(filtered, pageFiltered...)
+		nextPageToken = pageResp.NextPageToken
+	}
+
+	return filtered, nil
 }
 
 func isRetryableStatus(status int) bool {
@@ -133,7 +155,7 @@ func isRetryableStatus(status int) bool {
 	}
 }
 
-func (c *placesClient) doPost(ctx context.Context, url string, payload any) ([]Place, error) {
+func (c *placesClient) doPost(ctx context.Context, url string, payload any) (*PlacesResponse, error) {
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("序列化 API 請求失敗: %w", err)
@@ -192,7 +214,7 @@ func (c *placesClient) doPost(ctx context.Context, url string, payload any) ([]P
 			return nil, fmt.Errorf("解析 Places API 回應失敗: %w", err)
 		}
 
-		return placesResp.Places, nil
+		return &placesResp, nil
 	}
 
 	return nil, lastErr

@@ -127,21 +127,22 @@ func TestPrivacy_LocationNameNeverExposed(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	// 使用者將位置別名設定為「我家私密住址」
-	_ = svc.SetPreference(ctx, "user-privacy", "我家私密住址", 25.0339, 121.5644, 1000)
+	testNames := []string{"我家", "公司", "宿舍", "住家", "我家私密住址"}
+	for _, name := range testNames {
+		userID := "user-privacy-" + name
+		_ = svc.SetPreference(ctx, userID, name, 25.0339, 121.5644, 1000)
 
-	// 使用預設偏好抽籤
-	res, err := svc.Draw(ctx, DrawRequest{UserID: "user-privacy"})
-	if err != nil {
-		t.Fatalf("Draw failed: %v", err)
-	}
+		res, err := svc.Draw(ctx, DrawRequest{UserID: userID})
+		if err != nil {
+			t.Fatalf("Draw failed for %s: %v", name, err)
+		}
 
-	// 公開抽籤結果之 LocationName 絕對不得出現使用者自訂的「我家私密住址」
-	if res.QueryCtx.LocationName == "我家私密住址" {
-		t.Fatalf("CRITICAL: Private location name leaked in DrawResult.QueryCtx: %s", res.QueryCtx.LocationName)
-	}
-	if res.QueryCtx.LocationName != "預設位置" {
-		t.Errorf("expected LocationName to be '預設位置', got '%s'", res.QueryCtx.LocationName)
+		if res.QueryCtx.LocationName == name {
+			t.Fatalf("CRITICAL: Private location name %s leaked in DrawResult.QueryCtx: %s", name, res.QueryCtx.LocationName)
+		}
+		if res.QueryCtx.LocationName != "預設位置" {
+			t.Errorf("expected LocationName to be '預設位置', got '%s'", res.QueryCtx.LocationName)
+		}
 	}
 }
 

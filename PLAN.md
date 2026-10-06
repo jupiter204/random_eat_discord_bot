@@ -13,11 +13,11 @@
 - [x] SQLite 持久化儲存（`modernc.org/sqlite`，WAL 模式、單連線池與 2MB 快取限制）
 
 ### 2. Google Places API (New) 整合
-- [x] 周邊探索真正呼叫 `searchNearby`（端點：`POST /v1/places:searchNearby`）
-- [x] 關鍵字搜尋真正呼叫 `searchText`（端點：`POST /v1/places:searchText`）
+- [x] 周邊探索真正呼叫 `searchNearby`（端點：`POST /v1/places:searchNearby`，Request 不含 `openNow` 欄位）
+- [x] 關鍵字搜尋真正呼叫 `searchText`（端點：`POST /v1/places:searchText`，支援最多 2 頁分頁以避免遠處店家排於首頁導致誤判無結果）
 - [x] 嚴格餐廳類別限定（`includedType: "restaurant"` 與 `strictTypeFiltering: true`）
 - [x] 嚴格搜尋半徑保障（後端 Haversine 大圓距離計算，保證不超出指定半徑）
-- [x] 明確營業中過濾（僅接受明確 `openNow: true`，排除未知與無資料店家）
+- [x] 明確營業中過濾（應用層僅接受明確 `currentOpeningHours.openNow == true`，排除未知與無資料店家）
 - [x] 動態時區解析（依據 API 回傳之 `places.timeZone` 與 `places.utcOffsetMinutes` 計算營業星期）
 - [x] HTTP 逾時與重試機制（10 秒 Timeout，針對 429 與 5xx 暫態錯誤實作指數退避重試）
 - [x] 嚴格欄位遮罩（Field Mask 最佳化，兼顧過濾所需欄位與 API 成本控制）
@@ -35,19 +35,20 @@
 - [x] 3 秒 Interaction 逾時防護（Deferred Response 機制）
 - [x] `/set` Ephemeral 私密設定回應，保護住家與辦公室等敏感位置
 - [x] `/eat` 公開卡片渲染（店名連結、評分、營業時間、價位標籤、不洩漏私密位置）
-- [x] 頻道共同決策 Reroll 按鈕互動（零 API 費用，即時更新原卡片並標示發起者）
+- [x] 頻道共同決策 Reroll 按鈕互動（同一 Session 重抽零 API 額度，即時更新原卡片並標示發起者）
 - [x] 候選抽完時自動停用「再抽一家」按鈕
 
 ### 5. 測試覆蓋
-- [x] Google API Client 單元與 Mock 伺服器測試（包含各類狀態碼、重試、逾時、異常 JSON）
-- [x] 抽籤服務單元測試（包含邊界座標、成對驗證、候選用罄、重抽排重、並行存取）
+- [x] Google API Client 單元與 Mock 伺服器測試（包含 Request 欄位合約檢查、各類狀態碼、重試、分頁、逾時、異常 JSON）
+- [x] 抽籤服務單元測試（包含邊界座標、成對驗證、候選用罄、重抽排重、隱私防護、並行存取）
 - [x] Discord Views 卡片渲染與隱私防護單元測試
 
 ---
 
 ## 🔮 Planned (未來規劃項目)
 
-### 1. 互動與使用者體驗增強
+### 1. 搜尋與篩選強化
+- [ ] Text Search 動態分頁深度設定（目前限制最多 2 頁，可在設定中調整最大抓取頁數）
 - [ ] 支援 Discord 互動式下拉選單（例如：篩選特定價位區間 $ ~ $$$$）
 - [ ] 支援依照 Google 評分下限篩選（例如：僅抽取評分 $\ge 4.0$ 的店家）
 - [ ] 支援自訂排除黑名單餐廳（例如：使用者可標記不喜歡的店家）

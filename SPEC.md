@@ -10,6 +10,7 @@
 - **極輕量與極低資源佔用**：純 Go SQLite 驅動，記憶體常駐約 5~10 MB。
 - **單次查詢與零 API 浪費重抽機制**：批次取得候選餐廳並暫存於記憶體（10 分鐘 TTL），按鈕重抽完全由記憶體挑選，不重新呼叫 Google API。
 - **嚴格過濾與品質保證**：嚴格限制餐廳類別、嚴格 Haversine 半徑限制、明確營業狀態過濾與所在時區動態解析。
+- **客觀隨機抽選**：隨機選擇範圍為 Google Places API 回傳並通過條件過濾後的候選集合，而非保證掌握半徑內所有餐廳之全局清單。
 
 ### 核心技術選型
 
@@ -42,11 +43,11 @@ flowchart TD
 
     subgraph GooglePlaces["Google Places API (New) (Timeout: 10s, Retry: 429/5xx)"]
         PlacesSearch --> TextOrNearby{"是否有指定食物關鍵字?"}
-        TextOrNearby -- 無 (純附近) --> NearbyAPI["searchNearby (restaurant, openNow: true, locationRestriction)"]
+        TextOrNearby -- 無 (純附近) --> NearbyAPI["searchNearby (restaurant, maxResultCount: 20, locationRestriction)"]
         TextOrNearby -- 有 (指定品項) --> TextAPI["searchText (restaurant, strictTypeFiltering: true, openNow: true, locationBias)"]
     end
 
-    NearbyAPI --> FilterPhase["雙重過濾：OpenNow == true + Haversine 距離 <= 半徑"]
+    NearbyAPI --> FilterPhase["應用層過濾：currentOpeningHours.openNow == true + Haversine 距離 <= 半徑"]
     TextAPI --> FilterPhase
 
     FilterPhase --> LotteryService["抽籤調度與暫存 (Lottery Service)"]
@@ -131,11 +132,10 @@ flowchart TD
 - **API 模式 A：純周邊探索（searchNearby）**：
   - 端點：`POST https://places.googleapis.com/v1/places:searchNearby`
   - 適用：未輸入食物關鍵字，直接隨機抽附近營業中的餐廳。
-  - Payload：
+  - Payload（**注意：Places API (New) 之 searchNearby Request 不支援且不包含 openNow 欄位**）：
     ```json
     {
       "includedTypes": ["restaurant"],
-      "openNow": true,
       "maxResultCount": 20,
       "locationRestriction": {
         "circle": {
@@ -145,6 +145,7 @@ flowchart TD
       }
     }
     ```
+  - 營業狀態過濾：透過 Field Mask 請求 `places.currentOpeningHours`，回傳後由應用程式端過濾 `currentOpeningHours.openNow == true`。
 - **API 模式 B：特定餐點搜尋（searchText）**：
   - 端點：`POST https://places.googleapis.com/v1/places:searchText`
   - 適用：使用者指定餐點/關鍵字（如「拉麵」、「火鍋」）。
@@ -163,12 +164,14 @@ flowchart TD
       }
     }
     ```
+  - 分頁機制（Pagination）：若第 1 頁候選經半徑過濾後為 0 筆且存在 `nextPageToken`，最多使用 `pageToken` 額外抓取至第 2 頁，避免因 Google API 排序將遠處熱門店家排於首頁導致誤判無結果。
 - **搜尋半徑保證（Haversine 距離過濾）**：
-  - API 回傳後，後端以 Haversine 公式依實際經緯度計算店家與搜尋中心直線大圓距離：
+  - Nearby Search 透過 `locationRestriction` 限制圓形區域。
+  - Text Search 透過 `locationBias` 搜尋候選，後端再以 Haversine 公式依實際經緯度計算店家與搜尋中心直線大圓距離：
     $$\text{distance} \le \text{radiusMeters}$$
   - 超出半徑者全數剃除，保證 `/eat radius=X` 回傳店家絕不超出指定半徑。
 - **營業中狀態過濾**：
-  - 僅保留 API 明確回傳 `OpenNow == true` 之店家；若為 `false` 或 `nil`/未知則一律排除。
+  - 僅保留 API 明確回傳 `currentOpeningHours.openNow == true` 之店家；若為 `false` 或 `nil`/未知則一律排除，不以 regularOpeningHours 誤判即時營業狀態。
 - **時區解析（Timezone Awareness）**：
   - 依據 API 回傳之 `places.timeZone`（IANA ID 如 `Asia/Taipei`）或 `places.utcOffsetMinutes` 解析店家當地時間，對應精確今日星期，非硬編碼單一時區。
 - **Field Mask 與語系設定**：
@@ -237,10 +240,10 @@ flowchart TD
 ## 4. 驗收標準清單
 
 - [x] **Google Places API (New)**
-  - [x] `SearchNearbyRestaurants` 真正使用 `POST /v1/places:searchNearby`
-  - [x] `SearchTextRestaurants` 使用 `POST /v1/places:searchText` 並限制 `includedType: "restaurant"` 與 `strictTypeFiltering: true`
+  - [x] `SearchNearbyRestaurants` 真正使用 `POST /v1/places:searchNearby`，Request 絕不含 `openNow` 欄位
+  - [x] `SearchTextRestaurants` 使用 `POST /v1/places:searchText` 並限制 `includedType: "restaurant"` 與 `strictTypeFiltering: true`，支援最多 2 頁分頁過濾
   - [x] 後端實作 Haversine 距離過濾，保證不超出搜尋半徑
-  - [x] 僅保留明確營業中之店家（排除未知與打烊）
+  - [x] 僅保留 `currentOpeningHours.openNow == true` 之店家（排除未知與打烊）
   - [x] 依據 API 時區動態解析今日營業時間，無全域寫死時區
   - [x] 實作 10 秒 Timeout 與 429/5xx 指數退避重試
 - [x] **抽籤核心與快取**

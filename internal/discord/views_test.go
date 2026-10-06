@@ -38,8 +38,10 @@ func TestRenderDrawEmbed_PrivacyAndComponents(t *testing.T) {
 	// 驗證搜尋條件欄位未洩漏私人名稱
 	for _, field := range embed.Fields {
 		if field.Name == "🎯 搜尋條件" {
-			if strings.Contains(field.Value, "我家") || strings.Contains(field.Value, "公司") {
-				t.Errorf("private name found in search condition: %s", field.Value)
+			for _, privateWord := range []string{"我家", "公司", "宿舍", "住家"} {
+				if strings.Contains(field.Value, privateWord) {
+					t.Errorf("private name %s found in search condition: %s", privateWord, field.Value)
+				}
 			}
 			if !strings.Contains(field.Value, "預設位置") {
 				t.Errorf("expected 預設位置 in field value: %s", field.Value)
