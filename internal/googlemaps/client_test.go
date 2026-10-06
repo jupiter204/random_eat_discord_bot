@@ -88,6 +88,11 @@ func TestClient_SearchNearbyRestaurants_RequestContractAndSuccess(t *testing.T) 
 		t.Errorf("expected language zh-TW, got %s", capturedLang)
 	}
 
+	// 【關鍵合約測試】：確認 Nearby Search Field Mask 絕不包含 nextPageToken
+	if strings.Contains(capturedFieldMask, "nextPageToken") {
+		t.Fatal("Nearby Search Field Mask must not contain nextPageToken")
+	}
+
 	// 【關鍵合約測試】：確認 Nearby Search request body 絕不包含 openNow
 	if _, exists := capturedRawBody["openNow"]; exists {
 		t.Fatal("Nearby Search request must not contain openNow parameter")

@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	fieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
+	nearbyFieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone"
+	textFieldMask   = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
 )
 
 // Client 定義 Google Places API 用戶端介面
@@ -79,7 +80,7 @@ func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng flo
 	}
 
 	endpoint := c.baseURL + "/v1/places:searchNearby"
-	resp, err := c.doPost(ctx, endpoint, reqBody)
+	resp, err := c.doPost(ctx, endpoint, reqBody, nearbyFieldMask)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +110,7 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 	}
 
 	endpoint := c.baseURL + "/v1/places:searchText"
-	resp, err := c.doPost(ctx, endpoint, reqBody)
+	resp, err := c.doPost(ctx, endpoint, reqBody, textFieldMask)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +129,7 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 		pageReq := reqBody
 		pageReq.PageToken = nextPageToken
 
-		pageResp, pageErr := c.doPost(ctx, endpoint, pageReq)
+		pageResp, pageErr := c.doPost(ctx, endpoint, pageReq, textFieldMask)
 		if pageErr != nil {
 			return nil, fmt.Errorf("取得第 %d 頁餐廳失敗: %w", currentPage, pageErr)
 		}
@@ -155,7 +156,7 @@ func isRetryableStatus(status int) bool {
 	}
 }
 
-func (c *placesClient) doPost(ctx context.Context, url string, payload any) (*PlacesResponse, error) {
+func (c *placesClient) doPost(ctx context.Context, url string, payload any, mask string) (*PlacesResponse, error) {
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("序列化 API 請求失敗: %w", err)
@@ -181,7 +182,7 @@ func (c *placesClient) doPost(ctx context.Context, url string, payload any) (*Pl
 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Goog-Api-Key", c.apiKey)
-		req.Header.Set("X-Goog-FieldMask", fieldMask)
+		req.Header.Set("X-Goog-FieldMask", mask)
 		req.Header.Set("X-Goog-Language-Code", "zh-TW")
 
 		resp, err := c.httpClient.Do(req)

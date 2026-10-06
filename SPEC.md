@@ -175,7 +175,9 @@ flowchart TD
 - **時區解析（Timezone Awareness）**：
   - 依據 API 回傳之 `places.timeZone`（IANA ID 如 `Asia/Taipei`）或 `places.utcOffsetMinutes` 解析店家當地時間，對應精確今日星期，非硬編碼單一時區。
 - **Field Mask 與語系設定**：
-  - Header `X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
+  - Header `X-Goog-FieldMask`（端點專屬設定）：
+    - Nearby Search：`places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone`
+    - Text Search：`places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
   - Header `X-Goog-Language-Code: zh-TW`
   - Header `X-Goog-Api-Key: {GOOGLE_MAPS_API_KEY}`
 
