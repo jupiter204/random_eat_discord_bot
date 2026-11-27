@@ -43,7 +43,7 @@ flowchart TD
 
     subgraph GooglePlaces["Google Places API (New) (Timeout: 10s, Retry: 429/5xx)"]
         PlacesSearch --> TextOrNearby{"是否有指定食物關鍵字?"}
-        TextOrNearby -- 無 (純附近) --> NearbyAPI["searchNearby (restaurant, maxResultCount: 20, locationRestriction)"]
+        TextOrNearby -- 無 (純附近) --> NearbyAPI["searchNearby (restaurant/cafe/meal_takeaway/bakery, maxResultCount: 20, locationRestriction)"]
         TextOrNearby -- 有 (指定品項) --> TextAPI["searchText (restaurant, strictTypeFiltering: true, openNow: true, locationBias)"]
     end
 
@@ -135,7 +135,7 @@ flowchart TD
   - Payload（**注意：Places API (New) 之 searchNearby Request 不支援且不包含 openNow 欄位**）：
     ```json
     {
-      "includedTypes": ["restaurant"],
+      "includedTypes": ["restaurant", "cafe", "meal_takeaway", "bakery"],
       "maxResultCount": 20,
       "locationRestriction": {
         "circle": {

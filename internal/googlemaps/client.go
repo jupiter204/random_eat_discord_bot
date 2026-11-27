@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -14,6 +15,11 @@ const (
 	nearbyFieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone"
 	textFieldMask   = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
 )
+
+// NearbyIncludedTypes 為 Nearby Search 納入的店家類型（Google Places Table A）。
+// 僅用 restaurant 會漏掉被 Google 歸類為咖啡廳、外帶店、麵包店的用餐選擇；
+// 各類餐廳子類型（如 ramen_restaurant）本身即帶有 restaurant 類型，不需另外列出。
+var NearbyIncludedTypes = []string{"restaurant", "cafe", "meal_takeaway", "bakery"}
 
 // Client 定義 Google Places API 用戶端介面
 type Client interface {
@@ -66,7 +72,7 @@ func NewTestClient(apiKey, baseURL string, maxRetries int, baseDelay time.Durati
 // 注意：Google Places API (New) 的 searchNearby 不支援 openNow 請求參數，營業狀態過濾由取得 currentOpeningHours 後在應用層完成
 func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]Place, error) {
 	reqBody := NearbySearchRequest{
-		IncludedTypes:  []string{"restaurant"},
+		IncludedTypes:  NearbyIncludedTypes,
 		MaxResultCount: 20,
 		LocationRestriction: LocationRestriction{
 			Circle: Circle{
@@ -88,7 +94,10 @@ func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng flo
 	// 確保應用層過濾：僅保留確認營業中之店家 (基於 currentOpeningHours.openNow == true)
 	openPlaces := FilterOpenPlaces(resp.Places)
 	// 嚴格半徑過濾：確保回傳店家在指定半徑內
-	return FilterByRadius(openPlaces, lat, lng, radiusMeters), nil
+	filtered := FilterByRadius(openPlaces, lat, lng, radiusMeters)
+
+	logFilterStats("nearby", 1, resp.Places, len(openPlaces), len(filtered))
+	return filtered, nil
 }
 
 // SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的營業中餐廳 (使用 searchText)
@@ -118,6 +127,7 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 	// 應用層過濾：營業中與指定半徑過濾
 	openPlaces := FilterOpenPlaces(resp.Places)
 	filtered := FilterByRadius(openPlaces, lat, lng, radiusMeters)
+	logFilterStats("text", 1, resp.Places, len(openPlaces), len(filtered))
 
 	// 若第 1 頁候選經半徑過濾後為 0 筆且存在 nextPageToken，最多抓取第 2 頁，避免因 Google API 排序將遠處店家排於首頁導致誤判無結果
 	const maxPages = 2
@@ -136,11 +146,47 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 
 		pageOpen := FilterOpenPlaces(pageResp.Places)
 		pageFiltered := FilterByRadius(pageOpen, lat, lng, radiusMeters)
+		logFilterStats("text", currentPage, pageResp.Places, len(pageOpen), len(pageFiltered))
 		filtered = append(filtered, pageFiltered...)
 		nextPageToken = pageResp.NextPageToken
 	}
 
 	return filtered, nil
+}
+
+// FilterStats 為單次 API 回應在各過濾階段的店家數量，用於診斷候選名單為何變少
+type FilterStats struct {
+	Raw         int // Google 原始回傳筆數
+	OpenNow     int // 確認營業中
+	Closed      int // 明確標示休息中
+	UnknownOpen int // 無營業時間資料（亦會被排除）
+	InRadius    int // 營業中且位於半徑內（最終候選）
+}
+
+// ComputeFilterStats 統計各過濾階段數量；openCount 與 inRadius 由呼叫端的實際過濾結果傳入，確保與真實行為一致
+func ComputeFilterStats(raw []Place, openCount, inRadius int) FilterStats {
+	st := FilterStats{Raw: len(raw), OpenNow: openCount, InRadius: inRadius}
+	for _, p := range raw {
+		if p.CurrentOpeningHours == nil || p.CurrentOpeningHours.OpenNow == nil {
+			st.UnknownOpen++
+		} else if !*p.CurrentOpeningHours.OpenNow {
+			st.Closed++
+		}
+	}
+	return st
+}
+
+func logFilterStats(endpoint string, page int, raw []Place, openCount, inRadius int) {
+	st := ComputeFilterStats(raw, openCount, inRadius)
+	slog.Info("Places API 過濾統計",
+		"endpoint", endpoint,
+		"page", page,
+		"raw", st.Raw,
+		"open_now", st.OpenNow,
+		"closed", st.Closed,
+		"unknown_hours", st.UnknownOpen,
+		"in_radius", st.InRadius,
+	)
 }
 
 func isRetryableStatus(status int) bool {

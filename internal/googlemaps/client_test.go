@@ -3,6 +3,7 @@ package googlemaps
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,8 +100,8 @@ func TestClient_SearchNearbyRestaurants_RequestContractAndSuccess(t *testing.T) 
 	}
 
 	// 驗證 Request Body 其他必要合約欄位
-	if len(capturedReq.IncludedTypes) != 1 || capturedReq.IncludedTypes[0] != "restaurant" {
-		t.Errorf("expected includedTypes [restaurant], got %v", capturedReq.IncludedTypes)
+	if fmt.Sprint(capturedReq.IncludedTypes) != fmt.Sprint([]string{"restaurant", "cafe", "meal_takeaway", "bakery"}) {
+		t.Errorf("expected includedTypes [restaurant cafe meal_takeaway bakery], got %v", capturedReq.IncludedTypes)
 	}
 	if capturedReq.MaxResultCount != 20 {
 		t.Errorf("expected maxResultCount 20, got %d", capturedReq.MaxResultCount)

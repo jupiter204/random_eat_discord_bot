@@ -14,7 +14,7 @@
 - 🕔 **明確營業中過濾**：系統會使用 Google Places API 提供的 `currentOpeningHours.openNow` 判斷目前營業狀態，只保留 API 明確標示為營業中的餐廳；營業狀態未知的店家會排除。
 - 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應當地營業時間。
 - 🎯 **搜尋流程與半徑保證**：
-    - **無 keyword 搜尋**：呼叫 Nearby Search (`POST /v1/places:searchNearby`)，透過 `locationRestriction` 限制圓形區域，Request 不包含 `openNow` 欄位；由 API 回傳 `currentOpeningHours` 後在應用層過濾 `openNow == true`。
+    - **無 keyword 搜尋**：呼叫 Nearby Search (`POST /v1/places:searchNearby`)，設定 `includedTypes: [restaurant, cafe, meal_takeaway, bakery]`，透過 `locationRestriction` 限制圓形區域，Request 不包含 `openNow` 欄位；由 API 回傳 `currentOpeningHours` 後在應用層過濾 `openNow == true`。
     - **有 keyword 搜尋**：呼叫 Text Search (`POST /v1/places:searchText`)，設定 `includedType: restaurant`、`strictTypeFiltering: true`、`openNow: true` 與 `locationBias`；後端再以 Haversine 大圓距離公式進行嚴格過濾，保證最終回傳餐廳不超過指定半徑。若第 1 頁在半徑內為 0 筆，最多延伸翻查至第 2 頁，避免熱門遠端店家擠佔首頁。
 - 🎲 **客觀隨機抽選**：隨機選擇範圍是 Google Places API 搜尋並通過應用程式條件篩選後的候選集合，而非保證涵蓋指定半徑內所有餐廳。
 - 🔒 **隱私防護**：
@@ -38,7 +38,7 @@
  │      ↓
  │   Nearby Search (New) (POST /v1/places:searchNearby)
  │      ↓
- │   includedTypes: ["restaurant"], locationRestriction: circle (Request 不含 openNow)
+ │   includedTypes: ["restaurant", "cafe", "meal_takeaway", "bakery"], locationRestriction: circle (Request 不含 openNow)
  │      ↓
  │   API Response 取得 currentOpeningHours & location
  │      ↓

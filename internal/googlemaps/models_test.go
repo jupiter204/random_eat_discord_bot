@@ -283,3 +283,17 @@ func TestFilterByRadius(t *testing.T) {
 		t.Errorf("expected close place, got %s", filtered[0].ID)
 	}
 }
+
+func TestComputeFilterStats(t *testing.T) {
+	yes, no := true, false
+	raw := []Place{
+		{ID: "open", CurrentOpeningHours: &OpeningHours{OpenNow: &yes}},
+		{ID: "closed", CurrentOpeningHours: &OpeningHours{OpenNow: &no}},
+		{ID: "no-hours"},
+		{ID: "hours-without-flag", CurrentOpeningHours: &OpeningHours{}},
+	}
+	st := ComputeFilterStats(raw, 1, 1)
+	if st.Raw != 4 || st.OpenNow != 1 || st.Closed != 1 || st.UnknownOpen != 2 || st.InRadius != 1 {
+		t.Errorf("unexpected stats: %+v", st)
+	}
+}
