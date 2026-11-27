@@ -8,6 +8,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/bwmarrin/discordgo"
+
 	"random_eat_discord/internal/googlemaps"
 	"random_eat_discord/internal/lottery"
 )
@@ -107,5 +109,64 @@ func TestRenderCandidateListEmbed_TruncatesAndEscapes(t *testing.T) {
 	}
 	if !strings.Contains(embed.Title, "共 200 家") {
 		t.Errorf("title should show total count, got %q", embed.Title)
+	}
+}
+
+func TestRenderDrawEmbed_RerollButtonWithMorePages(t *testing.T) {
+	button := func(remaining int, hasMore bool) discordgo.Button {
+		_, comps := RenderDrawEmbed(&lottery.DrawResult{
+			SessionID:      "s",
+			Place:          &googlemaps.Place{ID: "p"},
+			RemainingCount: remaining,
+			HasMore:        hasMore,
+			QueryCtx:       lottery.QueryContext{Radius: 1000},
+		})
+		return comps[0].(discordgo.ActionsRow).Components[0].(discordgo.Button)
+	}
+
+	if b := button(0, true); b.Disabled || !strings.Contains(b.Label, "載入更多") {
+		t.Errorf("exhausted page with more pages: expected enabled load-more button, got %+v", b)
+	}
+	if b := button(0, false); !b.Disabled {
+		t.Errorf("no candidates and no more pages: expected disabled button")
+	}
+	if b := button(3, true); b.Disabled || strings.Contains(b.Label, "載入更多") {
+		t.Errorf("candidates remaining: expected normal button, got %+v", b)
+	}
+}
+
+func TestCanUseEatList(t *testing.T) {
+	h := NewHandler(nil, []string{"allowed-user"})
+	if !h.canUseEatList("allowed-user") {
+		t.Errorf("allowed user should be permitted")
+	}
+	if h.canUseEatList("someone-else") || h.canUseEatList("") {
+		t.Errorf("non-allowed or empty user must be rejected")
+	}
+	if NewHandler(nil, nil).canUseEatList("allowed-user") {
+		t.Errorf("empty allowlist must reject everyone")
+	}
+}
+
+func TestCommandsToRegister(t *testing.T) {
+	has := func(cmds []*discordgo.ApplicationCommand, name string) bool {
+		for _, c := range cmds {
+			if c.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	if has(commandsToRegister(false), eatListCommandName) {
+		t.Errorf("eat-list must not be registered without an allowlist")
+	}
+	enabled := commandsToRegister(true)
+	if !has(enabled, eatListCommandName) || len(enabled) != len(SlashCommands) {
+		t.Errorf("all commands including eat-list should be registered when enabled")
+	}
+	for _, name := range []string{"set", "eat", "unset", "help"} {
+		if !has(commandsToRegister(false), name) {
+			t.Errorf("command %s must always be registered", name)
+		}
 	}
 }

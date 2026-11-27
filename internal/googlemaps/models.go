@@ -39,6 +39,33 @@ type Place struct {
 	RegularOpeningHours *OpeningHours `json:"regularOpeningHours,omitempty"`
 	UTCOffsetMinutes    *int          `json:"utcOffsetMinutes,omitempty"`
 	TimeZone            *TimeZone     `json:"timeZone,omitempty"`
+	Types               []string      `json:"types,omitempty"`
+}
+
+// IsFoodPlace 判斷店家是否屬於餐飲類型（FoodPlaceTypes 之一，或任何 *_restaurant 子類型）
+func (p *Place) IsFoodPlace() bool {
+	for _, t := range p.Types {
+		if strings.HasSuffix(t, "_restaurant") {
+			return true
+		}
+		for _, food := range FoodPlaceTypes {
+			if t == food {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FilterFoodPlaces 過濾出餐飲類型店家
+func FilterFoodPlaces(places []Place) []Place {
+	out := make([]Place, 0, len(places))
+	for _, p := range places {
+		if p.IsFoodPlace() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // FormattedPriceLevel 將 Google 價位列舉轉換為簡潔易讀符號
@@ -185,31 +212,50 @@ type Circle struct {
 	Radius float64 `json:"radius"`
 }
 
-// LocationRestriction 搜尋半徑限制結構（用於 searchNearby）
-type LocationRestriction struct {
-	Circle Circle `json:"circle"`
-}
-
 // LocationBias 搜尋偏好結構（用於 searchText）
 type LocationBias struct {
 	Circle Circle `json:"circle"`
 }
 
-// NearbySearchRequest Places API (New) searchNearby 請求（不含 openNow 參數）
-type NearbySearchRequest struct {
-	IncludedTypes       []string            `json:"includedTypes"`
-	MaxResultCount      int                 `json:"maxResultCount,omitempty"`
-	LocationRestriction LocationRestriction `json:"locationRestriction"`
+// Viewport 以西南角（Low）與東北角（High）表示的矩形範圍
+type Viewport struct {
+	Low  LatLng `json:"low"`
+	High LatLng `json:"high"`
 }
 
-// TextSearchRequest Places API (New) searchText 請求
+// RectangleRestriction 矩形硬性範圍限制（searchText 的 locationRestriction 僅支援矩形）
+type RectangleRestriction struct {
+	Rectangle Viewport `json:"rectangle"`
+}
+
+// BoundingRectangle 計算可完整涵蓋指定圓形範圍的矩形（緯度夾在 ±90 之間）
+func BoundingRectangle(lat, lng float64, radiusMeters int) Viewport {
+	// 與 Haversine 使用相同地球半徑換算，並放大 1% 作為緩衝，確保矩形必定涵蓋整個圓
+	const metersPerDegreeLat = 2 * math.Pi * 6371000.0 / 360.0
+	r := float64(radiusMeters) * 1.01
+	dLat := r / metersPerDegreeLat
+	cosLat := math.Cos(lat * math.Pi / 180.0)
+	if cosLat < 0.01 {
+		cosLat = 0.01 // 極區附近避免除以接近 0
+	}
+	dLng := r / (metersPerDegreeLat * cosLat)
+
+	return Viewport{
+		Low:  LatLng{Latitude: math.Max(lat-dLat, -90), Longitude: math.Max(lng-dLng, -180)},
+		High: LatLng{Latitude: math.Min(lat+dLat, 90), Longitude: math.Min(lng+dLng, 180)},
+	}
+}
+
+// TextSearchRequest Places API (New) searchText 請求（locationBias 與 locationRestriction 擇一使用）
 type TextSearchRequest struct {
-	TextQuery           string       `json:"textQuery"`
-	IncludedType        string       `json:"includedType,omitempty"`
-	StrictTypeFiltering bool         `json:"strictTypeFiltering,omitempty"`
-	OpenNow             bool         `json:"openNow"`
-	PageToken           string       `json:"pageToken,omitempty"`
-	LocationBias        LocationBias `json:"locationBias"`
+	TextQuery           string                `json:"textQuery"`
+	IncludedType        string                `json:"includedType,omitempty"`
+	StrictTypeFiltering bool                  `json:"strictTypeFiltering,omitempty"`
+	OpenNow             bool                  `json:"openNow"`
+	PageSize            int                   `json:"pageSize,omitempty"`
+	PageToken           string                `json:"pageToken,omitempty"`
+	LocationBias        *LocationBias         `json:"locationBias,omitempty"`
+	LocationRestriction *RectangleRestriction `json:"locationRestriction,omitempty"`
 }
 
 // PlacesResponse Places API 統一回傳格式

@@ -297,3 +297,23 @@ func TestComputeFilterStats(t *testing.T) {
 		t.Errorf("unexpected stats: %+v", st)
 	}
 }
+
+func TestPlace_IsFoodPlace(t *testing.T) {
+	cases := map[string]struct {
+		types []string
+		want  bool
+	}{
+		"restaurant":   {[]string{"restaurant", "food"}, true},
+		"subtype":      {[]string{"ramen_restaurant"}, true},
+		"cafe":         {[]string{"cafe"}, true},
+		"takeaway":     {[]string{"meal_takeaway"}, true},
+		"lodging only": {[]string{"lodging", "point_of_interest"}, false},
+		"no types":     {nil, false},
+	}
+	for name, tc := range cases {
+		p := Place{Types: tc.types}
+		if got := p.IsFoodPlace(); got != tc.want {
+			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+}

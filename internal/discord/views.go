@@ -83,6 +83,9 @@ func RenderDrawEmbed(res *lottery.DrawResult) (*discordgo.MessageEmbed, []discor
 	}
 
 	footerText := fmt.Sprintf("剩餘 %d 家備選餐廳", res.RemainingCount)
+	if res.HasMore {
+		footerText += "（抽完後可再載入更多）"
+	}
 	if res.QueryCtx.Initiator != "" {
 		footerText = fmt.Sprintf("由 %s 發起 • %s", res.QueryCtx.Initiator, footerText)
 	}
@@ -109,8 +112,13 @@ func RenderDrawEmbed(res *lottery.DrawResult) (*discordgo.MessageEmbed, []discor
 		CustomID: fmt.Sprintf("reroll:%s", res.SessionID),
 	}
 	if res.RemainingCount == 0 {
-		rerollBtn.Disabled = true
-		rerollBtn.Label = "已無更多備選餐廳"
+		if res.HasMore {
+			// 這頁已抽完，下一次點擊會向 Google 載入下一頁
+			rerollBtn.Label = "🔄 再抽一家 (將載入更多餐廳)"
+		} else {
+			rerollBtn.Disabled = true
+			rerollBtn.Label = "已無更多備選餐廳"
+		}
 	}
 
 	components := []discordgo.MessageComponent{
@@ -187,14 +195,17 @@ func RenderCandidateListEmbed(res *lottery.ListResult) *discordgo.MessageEmbed {
 
 		line := fmt.Sprintf("`%2d.` %s • %s • %s • %s\n", idx+1, name, dist, rating, p.FormattedPriceLevel())
 		// 預留尾端「另有 N 家未顯示」提示空間
-		if utf8.RuneCountInString(b.String())+utf8.RuneCountInString(line) > maxDescriptionLen-40 {
+		if utf8.RuneCountInString(b.String())+utf8.RuneCountInString(line) > maxDescriptionLen-120 {
 			break
 		}
 		b.WriteString(line)
 		shown++
 	}
 	if hidden := len(res.Candidates) - shown; hidden > 0 {
-		fmt.Fprintf(&b, "…另有 %d 家未顯示", hidden)
+		fmt.Fprintf(&b, "…另有 %d 家未顯示\n", hidden)
+	}
+	if res.HasMore {
+		b.WriteString("\n📄 以上為第 1 頁；Google 還有下一頁，`/eat` 抽完這頁後會再載入。")
 	}
 
 	conditions := fmt.Sprintf("搜尋中心：%s • 半徑 %d 公尺", res.QueryCtx.LocationName, res.QueryCtx.Radius)
@@ -248,18 +259,13 @@ func RenderHelpEmbed() *discordgo.MessageEmbed {
 				Inline: false,
 			},
 			{
-				Name:   "🧪 `/eat-list` - 查看完整候選名單（測試用）",
-				Value:  "參數與 `/eat` 相同，列出這次會被抽的所有餐廳（依距離排序），僅自己可見。",
-				Inline: false,
-			},
-			{
 				Name:   "🗑️ `/unset` - 刪除個人預設坐標",
 				Value:  "不想再保存位置資料時，可隨時刪除已儲存的預設坐標。",
 				Inline: false,
 			},
 			{
-				Name:   "3️⃣ 🔄 零費用再抽一次 (Reroll)",
-				Value:  "抽籤結果卡片下方有「再抽一家」按鈕，點擊可即時從同批清單再挑選，**完全不重複扣 Google API 額度**。",
+				Name:   "3️⃣ 🔄 再抽一次 (Reroll)",
+				Value:  "抽籤結果卡片下方有「再抽一家」按鈕，點擊可從同批清單再挑選，**不重複扣 Google API 額度**；這批抽完時才會載入下一批餐廳。",
 				Inline: false,
 			},
 			{

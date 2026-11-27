@@ -2,6 +2,8 @@ package lottery
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -40,13 +42,40 @@ func (m *mockRepository) DeletePreference(ctx context.Context, userID string) er
 type mockMapsClient struct {
 	places []googlemaps.Place
 	err    error
+
+	// pages 設定時，SearchOpenRestaurantsPage 依 token "p<N>" 回傳第 N 頁（0 起算），否則回傳 places 且無下一頁
+	pages     [][]googlemaps.Place
+	pageErr   map[int]error
+	pageCalls int32
+	tokens    []string
+	mu        sync.Mutex
 }
 
-func (m *mockMapsClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]googlemaps.Place, error) {
+func (m *mockMapsClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng float64, radiusMeters int, pageToken string) ([]googlemaps.Place, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pageCalls++
+	m.tokens = append(m.tokens, pageToken)
+
 	if m.err != nil {
-		return nil, m.err
+		return nil, "", m.err
 	}
-	return m.places, nil
+	if m.pages == nil {
+		return m.places, "", nil
+	}
+
+	idx := 0
+	if pageToken != "" {
+		fmt.Sscanf(pageToken, "p%d", &idx)
+	}
+	if err := m.pageErr[idx]; err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if idx+1 < len(m.pages) {
+		next = fmt.Sprintf("p%d", idx+1)
+	}
+	return m.pages[idx], next, nil
 }
 
 func (m *mockMapsClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]googlemaps.Place, error) {
@@ -416,5 +445,164 @@ func TestList_SortedByDistanceWithSameValidation(t *testing.T) {
 	// 與 Draw 共用驗證規則
 	if _, err := svc.List(ctx, DrawRequest{UserID: "nobody"}); err != ErrNoPreference {
 		t.Errorf("expected ErrNoPreference, got %v", err)
+	}
+}
+
+func placesWithIDs(ids ...string) []googlemaps.Place {
+	out := make([]googlemaps.Place, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, googlemaps.Place{ID: id})
+	}
+	return out
+}
+
+func TestLazyPaging_DrawFetchesOnlyFirstPage(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{placesWithIDs("a", "b"), placesWithIDs("c")}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	res, err := svc.Draw(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	if client.pageCalls != 1 {
+		t.Errorf("expected Draw to fetch only 1 page, got %d calls", client.pageCalls)
+	}
+	if !res.HasMore || res.TotalCount != 2 || res.RemainingCount != 1 {
+		t.Errorf("unexpected result: HasMore=%v Total=%d Remaining=%d", res.HasMore, res.TotalCount, res.RemainingCount)
+	}
+}
+
+func TestLazyPaging_RerollLoadsNextPageOnlyWhenExhausted(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{placesWithIDs("a", "b"), placesWithIDs("b", "c")}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+	ctx := context.Background()
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	seen := map[string]bool{res.Place.ID: true}
+
+	// 第 1 頁還剩 1 家：不應呼叫 API
+	res, err = svc.Reroll(ctx, res.SessionID)
+	if err != nil {
+		t.Fatalf("Reroll 1 failed: %v", err)
+	}
+	seen[res.Place.ID] = true
+	if client.pageCalls != 1 {
+		t.Errorf("reroll within first page must not call API, got %d calls", client.pageCalls)
+	}
+	if res.RemainingCount != 0 || !res.HasMore {
+		t.Errorf("expected first page exhausted with more pages, got Remaining=%d HasMore=%v", res.RemainingCount, res.HasMore)
+	}
+
+	// 第 1 頁抽完：載入第 2 頁（b 重複應被去除，只新增 c）
+	res, err = svc.Reroll(ctx, res.SessionID)
+	if err != nil {
+		t.Fatalf("Reroll 2 failed: %v", err)
+	}
+	if client.pageCalls != 2 || client.tokens[1] != "p1" {
+		t.Errorf("expected second page fetched with token p1, calls=%d tokens=%v", client.pageCalls, client.tokens)
+	}
+	if res.Place.ID != "c" || seen["c"] {
+		t.Errorf("expected newly loaded place c, got %s", res.Place.ID)
+	}
+	if res.HasMore || res.RemainingCount != 0 {
+		t.Errorf("expected no more pages, got HasMore=%v Remaining=%d", res.HasMore, res.RemainingCount)
+	}
+
+	// 全部抽完且沒有下一頁
+	if _, err := svc.Reroll(ctx, res.SessionID); err != ErrNoMoreCandidates {
+		t.Errorf("expected ErrNoMoreCandidates, got %v", err)
+	}
+	if client.pageCalls != 2 {
+		t.Errorf("no extra API call expected after last page, got %d", client.pageCalls)
+	}
+}
+
+func TestLazyPaging_DrawSkipsEmptyFirstPage(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{{}, placesWithIDs("a"), placesWithIDs("b")}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	res, err := svc.Draw(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	if res.Place.ID != "a" || client.pageCalls != 2 || !res.HasMore {
+		t.Errorf("expected to skip empty page 1 and stop at page 2, got place=%s calls=%d hasMore=%v", res.Place.ID, client.pageCalls, res.HasMore)
+	}
+}
+
+func TestLazyPaging_StopsAtMaxPages(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{{}, {}, {}, placesWithIDs("never")}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	_, err := svc.Draw(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != ErrNoRestaurants {
+		t.Errorf("expected ErrNoRestaurants after %d empty pages, got %v", maxSearchPages, err)
+	}
+	if client.pageCalls != maxSearchPages {
+		t.Errorf("expected exactly %d page calls, got %d", maxSearchPages, client.pageCalls)
+	}
+}
+
+func TestLazyPaging_FailedLoadCanBeRetried(t *testing.T) {
+	boom := errors.New("network down")
+	client := &mockMapsClient{
+		pages:   [][]googlemaps.Place{placesWithIDs("a"), placesWithIDs("b")},
+		pageErr: map[int]error{1: boom},
+	}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+	ctx := context.Background()
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	if _, err := svc.Reroll(ctx, res.SessionID); !errors.Is(err, boom) {
+		t.Fatalf("expected load error, got %v", err)
+	}
+
+	client.mu.Lock()
+	delete(client.pageErr, 1)
+	client.mu.Unlock()
+
+	res2, err := svc.Reroll(ctx, res.SessionID)
+	if err != nil || res2.Place.ID != "b" {
+		t.Fatalf("expected retry to load page 2 and pick b, got %v, %v", res2, err)
+	}
+}
+
+func TestLazyPaging_ConcurrentExhaustedRerollsFetchOnce(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{placesWithIDs("a"), placesWithIDs("b", "c", "d", "e")}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+	ctx := context.Background()
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.Reroll(ctx, res.SessionID)
+			if err != nil && err != ErrLoadingMore && err != ErrNoMoreCandidates {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if client.pageCalls != 2 {
+		t.Errorf("expected next page fetched exactly once, got %d total calls", client.pageCalls)
 	}
 }

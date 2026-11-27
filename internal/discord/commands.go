@@ -48,6 +48,9 @@ var (
 		},
 	}
 
+	// eatListCommandName 為限定使用者的測試指令名稱
+	eatListCommandName = "eat-list"
+
 	// SlashCommands 定義所有 Slash Commands 規格
 	SlashCommands = []*discordgo.ApplicationCommand{
 		{
@@ -93,8 +96,8 @@ var (
 			Options:     searchOptions,
 		},
 		{
-			Name:        "eat-list",
-			Description: "（測試用）列出抽籤候選名單中的全部餐廳，僅自己可見",
+			Name:        eatListCommandName,
+			Description: "（限指定測試者）列出抽籤候選名單中的全部餐廳，僅自己可見",
 			Options:     searchOptions,
 		},
 		{
@@ -107,3 +110,15 @@ var (
 		},
 	}
 )
+
+// commandsToRegister 回傳實際要註冊的指令；未設定 /eat-list 允許名單時不註冊該指令
+func commandsToRegister(eatListEnabled bool) []*discordgo.ApplicationCommand {
+	cmds := make([]*discordgo.ApplicationCommand, 0, len(SlashCommands))
+	for _, cmd := range SlashCommands {
+		if cmd.Name == eatListCommandName && !eatListEnabled {
+			continue
+		}
+		cmds = append(cmds, cmd)
+	}
+	return cmds
+}

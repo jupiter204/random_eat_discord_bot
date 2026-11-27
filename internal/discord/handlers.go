@@ -16,13 +16,25 @@ import (
 // Handler 封裝 Discord 事件處理器
 type Handler struct {
 	lotteryService lottery.Service
+	// eatListAllowed 允許使用 /eat-list 的使用者 ID
+	eatListAllowed map[string]bool
 }
 
-// NewHandler 建立事件處理器
-func NewHandler(service lottery.Service) *Handler {
+// NewHandler 建立事件處理器；eatListAllowedUsers 為允許使用 /eat-list 測試指令的使用者 ID
+func NewHandler(service lottery.Service, eatListAllowedUsers []string) *Handler {
+	allowed := make(map[string]bool, len(eatListAllowedUsers))
+	for _, id := range eatListAllowedUsers {
+		allowed[id] = true
+	}
 	return &Handler{
 		lotteryService: service,
+		eatListAllowed: allowed,
 	}
+}
+
+// canUseEatList 判斷使用者是否可使用 /eat-list
+func (h *Handler) canUseEatList(userID string) bool {
+	return userID != "" && h.eatListAllowed[userID]
 }
 
 // HandleInteraction 處理所有 Discord Interaction 事件
@@ -52,7 +64,7 @@ func (h *Handler) handleApplicationCommand(s *discordgo.Session, i *discordgo.In
 		h.handleEatCommand(s, i)
 	case "unset":
 		h.handleUnsetCommand(s, i)
-	case "eat-list":
+	case eatListCommandName:
 		h.handleEatListCommand(s, i)
 	case "help":
 		h.handleHelpCommand(s, i)
@@ -172,6 +184,19 @@ func (h *Handler) handleEatCommand(s *discordgo.Session, i *discordgo.Interactio
 }
 
 func (h *Handler) handleEatListCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// 指令對所有人可見，於此擋下非允許名單的使用者（不呼叫 API）
+	if userID := getUserID(i); !h.canUseEatList(userID) {
+		slog.Warn("未授權使用者嘗試使用 /eat-list", "user_id", userID)
+		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{RenderErrorEmbed("無法使用此指令", "`/eat-list` 為測試指令，僅限指定使用者使用。")},
+				Flags:  discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
 	// 測試用途：私密回應，避免完整名單洗版頻道
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
@@ -235,7 +260,8 @@ func (h *Handler) handleReroll(s *discordgo.Session, i *discordgo.InteractionCre
 	callerID := getUserID(i)
 	slog.Info("收到再抽請求", "user_id", callerID, "initiator", caller, "session_id", sessionID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 這頁抽完時會向 Google 載入下一頁，逾時與 /eat 一致
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	res, err := h.lotteryService.Reroll(ctx, sessionID)
@@ -272,6 +298,7 @@ var publicErrors = []error{
 	lottery.ErrCoordinatePairRequired,
 	lottery.ErrSessionExpired,
 	lottery.ErrNoMoreCandidates,
+	lottery.ErrLoadingMore,
 	lottery.ErrNameTooLong,
 	lottery.ErrKeywordTooLong,
 }

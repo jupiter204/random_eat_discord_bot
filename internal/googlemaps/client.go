@@ -12,18 +12,24 @@ import (
 )
 
 const (
-	nearbyFieldMask = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone"
-	textFieldMask   = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
+	defaultFieldMask = "places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
+	textFieldMask    = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
 )
 
-// NearbyIncludedTypes 為 Nearby Search 納入的店家類型（Google Places Table A）。
+// FoodPlaceTypes 為預設搜尋視為餐飲的店家類型（Google Places Table A）。
 // 僅用 restaurant 會漏掉被 Google 歸類為咖啡廳、外帶店、麵包店的用餐選擇；
-// 各類餐廳子類型（如 ramen_restaurant）本身即帶有 restaurant 類型，不需另外列出。
-var NearbyIncludedTypes = []string{"restaurant", "cafe", "meal_takeaway", "bakery"}
+// 各類餐廳子類型（如 ramen_restaurant）另由 IsFoodPlace 以 *_restaurant 後綴判斷。
+var FoodPlaceTypes = []string{"restaurant", "cafe", "meal_takeaway", "bakery"}
 
 // Client 定義 Google Places API 用戶端介面
+// 無關鍵字時的預設搜尋設定（Text Search 每頁最多 20 筆）
+const (
+	DefaultTextQuery      = "餐廳"
+	defaultSearchPageSize = 20
+)
+
 type Client interface {
-	SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]Place, error)
+	SearchOpenRestaurantsPage(ctx context.Context, lat, lng float64, radiusMeters int, pageToken string) ([]Place, string, error)
 	SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]Place, error)
 }
 
@@ -68,38 +74,6 @@ func NewTestClient(apiKey, baseURL string, maxRetries int, baseDelay time.Durati
 	}
 }
 
-// SearchNearbyRestaurants 搜尋指定坐標與半徑內營業中的餐廳 (使用 searchNearby)
-// 注意：Google Places API (New) 的 searchNearby 不支援 openNow 請求參數，營業狀態過濾由取得 currentOpeningHours 後在應用層完成
-func (c *placesClient) SearchNearbyRestaurants(ctx context.Context, lat, lng float64, radiusMeters int) ([]Place, error) {
-	reqBody := NearbySearchRequest{
-		IncludedTypes:  NearbyIncludedTypes,
-		MaxResultCount: 20,
-		LocationRestriction: LocationRestriction{
-			Circle: Circle{
-				Center: LatLng{
-					Latitude:  lat,
-					Longitude: lng,
-				},
-				Radius: float64(radiusMeters),
-			},
-		},
-	}
-
-	endpoint := c.baseURL + "/v1/places:searchNearby"
-	resp, err := c.doPost(ctx, endpoint, reqBody, nearbyFieldMask)
-	if err != nil {
-		return nil, err
-	}
-
-	// 確保應用層過濾：僅保留確認營業中之店家 (基於 currentOpeningHours.openNow == true)
-	openPlaces := FilterOpenPlaces(resp.Places)
-	// 嚴格半徑過濾：確保回傳店家在指定半徑內
-	filtered := FilterByRadius(openPlaces, lat, lng, radiusMeters)
-
-	logFilterStats("nearby", 1, resp.Places, len(openPlaces), len(filtered))
-	return filtered, nil
-}
-
 // SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的營業中餐廳 (使用 searchText)
 func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]Place, error) {
 	reqBody := TextSearchRequest{
@@ -107,7 +81,7 @@ func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, 
 		IncludedType:        "restaurant",
 		StrictTypeFiltering: true,
 		OpenNow:             true,
-		LocationBias: LocationBias{
+		LocationBias: &LocationBias{
 			Circle: Circle{
 				Center: LatLng{
 					Latitude:  lat,
@@ -176,7 +150,7 @@ func ComputeFilterStats(raw []Place, openCount, inRadius int) FilterStats {
 	return st
 }
 
-func logFilterStats(endpoint string, page int, raw []Place, openCount, inRadius int) {
+func logFilterStats(endpoint string, page any, raw []Place, openCount, inRadius int) {
 	st := ComputeFilterStats(raw, openCount, inRadius)
 	slog.Info("Places API 過濾統計",
 		"endpoint", endpoint,
@@ -187,6 +161,45 @@ func logFilterStats(endpoint string, page int, raw []Place, openCount, inRadius 
 		"unknown_hours", st.UnknownOpen,
 		"in_radius", st.InRadius,
 	)
+}
+
+// SearchOpenRestaurantsPage 無關鍵字時的預設搜尋（單頁）：以 Text Search 搜尋「餐廳」並由 API 端過濾營業中（openNow），
+// 範圍以涵蓋圓形半徑的矩形硬性限制；回傳前於應用層過濾餐飲類型、營業中與實際半徑。
+// pageToken 為空時取第 1 頁；回傳之 nextPageToken 為空代表已無下一頁（Google 最多提供 3 頁共 60 筆）。
+// 分頁請求必須與第 1 頁使用完全相同的參數，故由本函式統一組裝。
+func (c *placesClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng float64, radiusMeters int, pageToken string) ([]Place, string, error) {
+	reqBody := TextSearchRequest{
+		TextQuery: DefaultTextQuery,
+		OpenNow:   true,
+		PageSize:  defaultSearchPageSize,
+		PageToken: pageToken,
+		LocationRestriction: &RectangleRestriction{
+			Rectangle: BoundingRectangle(lat, lng, radiusMeters),
+		},
+	}
+
+	resp, err := c.doPost(ctx, c.baseURL+"/v1/places:searchText", reqBody, defaultFieldMask)
+	if err != nil {
+		return nil, "", err
+	}
+
+	food := FilterFoodPlaces(resp.Places)
+	open := FilterOpenPlaces(food)
+	inRadius := FilterByRadius(open, lat, lng, radiusMeters)
+	logFilterStats("text-default", pageLabel(pageToken), resp.Places, len(open), len(inRadius))
+	if dropped := len(resp.Places) - len(food); dropped > 0 {
+		slog.Info("排除非餐飲類型店家", "count", dropped)
+	}
+
+	return inRadius, resp.NextPageToken, nil
+}
+
+// pageLabel 供 log 區分首頁與後續分頁（實際頁序由 lottery 層掌握）
+func pageLabel(pageToken string) string {
+	if pageToken == "" {
+		return "first"
+	}
+	return "next"
 }
 
 func isRetryableStatus(status int) bool {
