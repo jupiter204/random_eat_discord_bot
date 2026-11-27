@@ -43,19 +43,21 @@ type mockMapsClient struct {
 	places []googlemaps.Place
 	err    error
 
-	// pages 設定時，SearchOpenRestaurantsPage 依 token "p<N>" 回傳第 N 頁（0 起算），否則回傳 places 且無下一頁
+	// pages 設定時，SearchRestaurantsPage 依 token "p<N>" 回傳第 N 頁（0 起算），否則回傳 places 且無下一頁
 	pages     [][]googlemaps.Place
 	pageErr   map[int]error
 	pageCalls int32
 	tokens    []string
+	keywords  []string
 	mu        sync.Mutex
 }
 
-func (m *mockMapsClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng float64, radiusMeters int, pageToken string) ([]googlemaps.Place, string, error) {
+func (m *mockMapsClient) SearchRestaurantsPage(ctx context.Context, keyword string, lat, lng float64, radiusMeters int, pageToken string) ([]googlemaps.Place, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pageCalls++
 	m.tokens = append(m.tokens, pageToken)
+	m.keywords = append(m.keywords, keyword)
 
 	if m.err != nil {
 		return nil, "", m.err
@@ -76,13 +78,6 @@ func (m *mockMapsClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng
 		next = fmt.Sprintf("p%d", idx+1)
 	}
 	return m.pages[idx], next, nil
-}
-
-func (m *mockMapsClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]googlemaps.Place, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	return m.places, nil
 }
 
 func floatPtr(f float64) *float64 {
@@ -604,5 +599,27 @@ func TestLazyPaging_ConcurrentExhaustedRerollsFetchOnce(t *testing.T) {
 
 	if client.pageCalls != 2 {
 		t.Errorf("expected next page fetched exactly once, got %d total calls", client.pageCalls)
+	}
+}
+
+func TestKeywordSearch_UsesLazyPagingWithSameKeyword(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{placesWithIDs("a"), placesWithIDs("b")}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+	ctx := context.Background()
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1", Keyword: "拉麵", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	if client.pageCalls != 1 || !res.HasMore {
+		t.Fatalf("keyword search should load only page 1 and keep next page, calls=%d hasMore=%v", client.pageCalls, res.HasMore)
+	}
+
+	if _, err := svc.Reroll(ctx, res.SessionID); err != nil {
+		t.Fatalf("Reroll failed: %v", err)
+	}
+	if fmt.Sprint(client.keywords) != fmt.Sprint([]string{"拉麵", "拉麵"}) {
+		t.Errorf("next page must reuse the original keyword, got %v", client.keywords)
 	}
 }

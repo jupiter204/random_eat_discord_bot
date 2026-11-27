@@ -10,12 +10,12 @@
 - 💸 **API 呼叫與成本最佳化**：
     - **純座標定位**：使用者直接輸入經緯度，省去 Geocoding 地址轉換費用。
     - **單次搜尋與 Session 快取**：初次搜尋批次取得候選餐廳並快取於記憶體（10 分鐘 TTL），同一 `/eat` Session 的 Reroll 使用已取得的候選集合，**不會因每次 Reroll 再次呼叫 Google Places API**。
-    - **欄位遮罩 (Field Mask)**：使用精確的端點專屬 Field Mask（預設搜尋額外請求 `places.types` 以過濾餐飲類型，兩種 Text Search 皆包含 `nextPageToken`）控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
+    - **欄位遮罩 (Field Mask)**：使用精確的端點專屬 Field Mask（包含 `places.types` 以過濾餐飲類型，及 `nextPageToken` 以支援延遲分頁）控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
 - 🕔 **明確營業中過濾**：系統會使用 Google Places API 提供的 `currentOpeningHours.openNow` 判斷目前營業狀態，只保留 API 明確標示為營業中的餐廳；營業狀態未知的店家會排除。
 - 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應當地營業時間。
 - 🎯 **搜尋流程與半徑保證**：
-    - **無 keyword 搜尋**：呼叫 Text Search (`POST /v1/places:searchText`)，`textQuery: 餐廳`、`openNow: true`（由 API 端過濾營業中），以涵蓋搜尋半徑的矩形 `locationRestriction` 硬性限制範圍，每頁 20 筆；應用層再過濾餐飲類型（restaurant、cafe、meal_takeaway、bakery 及各 `*_restaurant` 子類型）、營業中與 Haversine 實際半徑。**延遲分頁**：`/eat` 只載入第 1 頁（若過濾後為 0 筆才往下翻），「再抽一家」抽完這頁時才載入下一頁，最多 3 頁（60 筆）；同一 Session 同時只會有一個請求載入下一頁。
-    - **有 keyword 搜尋**：呼叫 Text Search (`POST /v1/places:searchText`)，設定 `includedType: restaurant`、`strictTypeFiltering: true`、`openNow: true` 與 `locationBias`；後端再以 Haversine 大圓距離公式進行嚴格過濾，保證最終回傳餐廳不超過指定半徑。若第 1 頁在半徑內為 0 筆，最多延伸翻查至第 2 頁，避免熱門遠端店家擠佔首頁。
+    - **搜尋方式**：有無 keyword 皆呼叫 Text Search (`POST /v1/places:searchText`)，`textQuery` 為使用者輸入的 keyword（未提供時為「餐廳」），搭配 `openNow: true`（由 API 端過濾營業中），以涵蓋搜尋半徑的矩形 `locationRestriction` 硬性限制範圍，每頁 20 筆；應用層再過濾餐飲類型（restaurant、cafe、meal_takeaway、bakery 及各 `*_restaurant` 子類型）、營業中與 Haversine 實際半徑。不使用 `includedType`/`strictTypeFiltering`，避免搜尋「咖啡」、「麵包」時排除咖啡廳與麵包店。
+    - **延遲分頁**：`/eat` 只載入第 1 頁（若過濾後為 0 筆才往下翻），「再抽一家」抽完這頁時才以相同 keyword 載入下一頁，最多 3 頁（60 筆）；同一 Session 同時只會有一個請求載入下一頁。
 - 🎲 **客觀隨機抽選**：隨機選擇範圍是 Google Places API 搜尋並通過應用程式條件篩選後的候選集合，而非保證涵蓋指定半徑內所有餐廳。
 - 🔒 **隱私防護**：
     - `/set` 個人位置設定採用 **Ephemeral（私密訊息）**。
@@ -32,31 +32,21 @@
 ## 🔍 搜尋與抽選流程說明
 
 ```text
-/eat
+/eat [keyword]
  │
- ├─ 無 keyword
+ ├─ textQuery = keyword（未提供時為「餐廳」）
  │      ↓
  │   Text Search (New) (POST /v1/places:searchText)，只載入第 1 頁
  │      ↓
- │   textQuery: "餐廳", openNow: true, pageSize: 20, locationRestriction: 外接矩形
+ │   textQuery, openNow: true, pageSize: 20, locationRestriction: 外接矩形
  │      ↓
  │   應用層過濾：餐飲類型 && currentOpeningHours.openNow == true && Haversine 距離 <= radius
  │      ↓
+ │   (第 1 頁過濾後為 0 筆且有 nextPageToken 時才往下翻)
+ │      ↓
  │   隨機抽取 1 家，其餘候選與 nextPageToken 存入 Session Cache (10m TTL)
  │      ↓
- │   「再抽一家」抽完本頁時才載入下一頁（最多 3 頁 / 60 家）
- │
- └─ 有 keyword (例如拉麵)
-        ↓
-     Text Search (New) (POST /v1/places:searchText)
-        ↓
-     includedType: "restaurant", strictTypeFiltering: true, openNow: true, locationBias
-        ↓
-     應用層過濾：currentOpeningHours.openNow == true && Haversine 距離 <= radius
-        ↓
-     (若第 1 頁半徑內候選為 0 筆且存在 nextPageToken，最多抓取至第 2 頁)
-        ↓
-     隨機抽取 1 家，其餘候選存入 Session Cache (10m TTL)
+ └─ 「再抽一家」抽完本頁時，以相同 keyword 載入下一頁（最多 3 頁 / 60 家）
 ```
 
 ---
@@ -191,7 +181,7 @@ random_eat_discord/
 │   │   ├── models.go              # UserPreference 資料模型
 │   │   └── repository.go          # 使用者偏好 CRUD 實作
 │   ├── googlemaps/
-│   │   ├── client.go              # Places API (New) searchText（預設搜尋與關鍵字搜尋）與重試機制
+│   │   ├── client.go              # Places API (New) searchText（有無關鍵字共用）與重試機制
 │   │   ├── client_test.go         # API Client 單元與 Mock 測試
 │   │   ├── models.go              # Places API 資料結構、時區解析與 Haversine 距離過濾
 │   │   └── models_test.go         # 資料模型與營業狀態測試

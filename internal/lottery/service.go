@@ -280,19 +280,9 @@ func (s *lotteryService) searchCandidates(ctx context.Context, req DrawRequest) 
 		}
 	}
 
-	// 2. 呼叫 Google Places API (New)
-	//    有關鍵字：Text Search（自帶分頁邏輯，不延遲載入）
-	//    無關鍵字：預設搜尋只取第 1 頁，下一頁留待 Reroll 抽完時再載入以節省 API 呼叫
-	var places []googlemaps.Place
-	var nextPageToken string
-	pagesLoaded := 1
-	var err error
-	if req.Keyword != "" {
-		places, err = s.mapsClient.SearchTextRestaurants(ctx, req.Keyword, targetLat, targetLng, targetRadius)
-	} else {
-		places, nextPageToken, pagesLoaded, err = s.fetchUntilNonEmpty(ctx, targetLat, targetLng, targetRadius, "", 0)
-	}
-
+	// 2. 呼叫 Google Places API (New)：有無關鍵字皆使用相同的 Text Search 延遲分頁流程，
+	//    只載入第 1 頁，下一頁留待 Reroll 抽完時再載入以節省 API 呼叫
+	places, nextPageToken, pagesLoaded, err := s.fetchUntilNonEmpty(ctx, req.Keyword, targetLat, targetLng, targetRadius, "", 0)
 	if err != nil {
 		return searchOutcome{}, fmt.Errorf("搜尋餐廳失敗: %w", err)
 	}
@@ -315,9 +305,9 @@ func (s *lotteryService) searchCandidates(ctx context.Context, req DrawRequest) 
 
 // fetchUntilNonEmpty 從 pageToken 開始載入預設搜尋分頁，直到過濾後至少有 1 家、沒有下一頁或達到頁數上限為止。
 // 避免某一頁剛好全被過濾掉（範圍外、非餐飲）時就誤判為沒有餐廳。回傳累計已載入頁數。
-func (s *lotteryService) fetchUntilNonEmpty(ctx context.Context, lat, lng float64, radius int, pageToken string, pagesLoaded int) ([]googlemaps.Place, string, int, error) {
+func (s *lotteryService) fetchUntilNonEmpty(ctx context.Context, keyword string, lat, lng float64, radius int, pageToken string, pagesLoaded int) ([]googlemaps.Place, string, int, error) {
 	for pagesLoaded < maxSearchPages {
-		places, next, err := s.mapsClient.SearchOpenRestaurantsPage(ctx, lat, lng, radius, pageToken)
+		places, next, err := s.mapsClient.SearchRestaurantsPage(ctx, keyword, lat, lng, radius, pageToken)
 		if err != nil {
 			if pagesLoaded > 0 {
 				return nil, "", pagesLoaded, fmt.Errorf("取得第 %d 頁餐廳失敗: %w", pagesLoaded+1, err)
@@ -366,7 +356,8 @@ func (s *lotteryService) loadNextPage(ctx context.Context, sessionID string) err
 		return err
 	}
 
-	places, next, newPagesLoaded, err := s.fetchUntilNonEmpty(ctx, qCtx.Latitude, qCtx.Longitude, qCtx.Radius, token, pagesLoaded)
+	// 下一頁必須沿用第 1 頁的關鍵字，Google 的 pageToken 才有效
+	places, next, newPagesLoaded, err := s.fetchUntilNonEmpty(ctx, qCtx.Keyword, qCtx.Latitude, qCtx.Longitude, qCtx.Radius, token, pagesLoaded)
 	if err != nil {
 		s.sessionCache.AbortNextPage(sessionID)
 		return fmt.Errorf("載入下一頁餐廳失敗: %w", err)

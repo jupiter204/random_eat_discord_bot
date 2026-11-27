@@ -42,13 +42,10 @@ flowchart TD
     UsePrefCoord --> PlacesSearch
 
     subgraph GooglePlaces["Google Places API (New) (Timeout: 10s, Retry: 429/5xx)"]
-        PlacesSearch --> HasKeyword{"是否有指定食物關鍵字?"}
-        HasKeyword -- 無 (預設搜尋) --> DefaultAPI["searchText (textQuery: 餐廳, openNow: true, pageSize: 20, 矩形 locationRestriction, 僅載入第 1 頁)"]
-        HasKeyword -- 有 (指定品項) --> TextAPI["searchText (restaurant, strictTypeFiltering: true, openNow: true, locationBias)"]
+        PlacesSearch --> SearchAPI["searchText (textQuery: 關鍵字或「餐廳」, openNow: true, pageSize: 20, 矩形 locationRestriction, 僅載入第 1 頁)"]
     end
 
-    DefaultAPI --> FilterPhase["應用層過濾：餐飲類型 (僅預設搜尋) + currentOpeningHours.openNow == true + Haversine 距離 <= 半徑"]
-    TextAPI --> FilterPhase
+    SearchAPI --> FilterPhase["應用層過濾：餐飲類型 + currentOpeningHours.openNow == true + Haversine 距離 <= 半徑"]
 
     FilterPhase --> LotteryService["抽籤調度與暫存 (Lottery Service)"]
 
@@ -131,14 +128,14 @@ flowchart TD
   - 超時時間：統一為 **10 秒**。
   - 重試策略：針對 429 (Too Many Requests)、500、502、503、504 與暫態網路連線異常進行最多 2 次重試（指數退避：100ms, 200ms）。
   - 不可重試錯誤：400、401、403、404 等客戶端錯誤立即中斷並回報，不進行無意義重試。
-- **API 模式 A：預設搜尋（searchText + openNow，延遲分頁）**：
+- **餐廳搜尋（searchText + openNow，延遲分頁；有無關鍵字共用）**：
   - 端點：`POST https://places.googleapis.com/v1/places:searchText`
-  - 適用：未輸入食物關鍵字，直接隨機抽附近營業中的餐廳。
+  - `textQuery`：使用者輸入之關鍵字（如「拉麵」、「火鍋」）；未輸入時為「餐廳」。
   - 採用 Text Search 而非 Nearby Search 之原因：Nearby Search (New) 不支援 `openNow` 請求參數且最多僅回傳 20 筆、無分頁；Text Search 可由 API 端過濾營業中，並支援最多 3 頁（共 60 筆）。
   - Payload（searchText 之 `locationRestriction` 僅支援矩形，以涵蓋搜尋圓形之外接矩形（放大 1% 緩衝）硬性限制範圍）：
     ```json
     {
-      "textQuery": "餐廳",
+      "textQuery": "拉麵",
       "openNow": true,
       "pageSize": 20,
       "locationRestriction": {
@@ -150,33 +147,14 @@ flowchart TD
     }
     ```
   - 餐飲類型過濾：透過 Field Mask 請求 `places.types`，僅保留 `restaurant`、`cafe`、`meal_takeaway`、`bakery` 或任何 `*_restaurant` 子類型之店家。
+  - 不使用 `includedType`/`strictTypeFiltering`：限定單一類型會在搜尋「咖啡」、「麵包」等關鍵字時排除咖啡廳與麵包店，改由應用層餐飲類型過濾。
   - 延遲分頁（Lazy Pagination）：
     - `/eat` 僅載入第 1 頁；若第 1 頁過濾後為 0 筆且存在 `nextPageToken`，才繼續往下載入，避免誤判無結果。
-    - `nextPageToken` 存入 Session；Reroll 抽完目前候選且仍有下一頁時，才使用 `pageToken` 載入下一頁（其餘參數與第 1 頁完全相同），新店家依 place ID 去重後附加至候選名單。
+    - `nextPageToken` 存入 Session；Reroll 抽完目前候選且仍有下一頁時，才使用 `pageToken` 載入下一頁（關鍵字與其餘參數與第 1 頁完全相同），新店家依 place ID 去重後附加至候選名單。
     - 同一 Session 同時僅允許一個請求載入下一頁，其他並行點擊回傳 `ErrLoadingMore`（「正在載入更多餐廳，請稍後再按一次」）；載入失敗時保留 token 供重試。
     - 最多 3 頁，達上限後視為無下一頁。
-- **API 模式 B：特定餐點搜尋（searchText）**：
-  - 端點：`POST https://places.googleapis.com/v1/places:searchText`
-  - 適用：使用者指定餐點/關鍵字（如「拉麵」、「火鍋」）。
-  - Payload：
-    ```json
-    {
-      "textQuery": "拉麵",
-      "includedType": "restaurant",
-      "strictTypeFiltering": true,
-      "openNow": true,
-      "locationBias": {
-        "circle": {
-          "center": { "latitude": 25.0339, "longitude": 121.5644 },
-          "radius": 1000.0
-        }
-      }
-    }
-    ```
-  - 分頁機制（Pagination）：若第 1 頁候選經半徑過濾後為 0 筆且存在 `nextPageToken`，最多使用 `pageToken` 額外抓取至第 2 頁，避免因 Google API 排序將遠處熱門店家排於首頁導致誤判無結果；若分頁請求失敗則將錯誤回傳上層，不靜默吞掉。
 - **搜尋半徑保證（Haversine 距離過濾）**：
-  - 預設搜尋透過矩形 `locationRestriction` 限制範圍，矩形四角超出圓形半徑之店家由 Haversine 過濾剃除。
-  - Text Search 透過 `locationBias` 搜尋候選，後端再以 Haversine 公式依實際經緯度計算店家與搜尋中心直線大圓距離：
+  - 透過矩形 `locationRestriction` 硬性限制範圍，後端再以 Haversine 公式依實際經緯度計算店家與搜尋中心直線大圓距離，剃除矩形四角超出圓形半徑之店家：
     $$\text{distance} \le \text{radiusMeters}$$
   - 超出半徑者全數剃除，保證 `/eat radius=X` 回傳店家絕不超出指定半徑。
 - **營業中狀態過濾**：
@@ -184,9 +162,8 @@ flowchart TD
 - **時區解析（Timezone Awareness）**：
   - 依據 API 回傳之 `places.timeZone`（IANA ID 如 `Asia/Taipei`）或 `places.utcOffsetMinutes` 解析店家當地時間，對應精確今日星期，非硬編碼單一時區。
 - **Field Mask 與語系設定**：
-  - Header `X-Goog-FieldMask`（端點專屬設定）：
-    - 預設搜尋：`places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
-    - 關鍵字搜尋：`places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
+  - Header `X-Goog-FieldMask`：
+    - `places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
   - Header `X-Goog-Language-Code: zh-TW`
   - Header `X-Goog-Api-Key: {GOOGLE_MAPS_API_KEY}`
 
@@ -203,7 +180,7 @@ flowchart TD
   - 使用者在 `/set` 儲存的自訂名稱（如「公司」、「我家」）僅儲存於資料庫供個人識別。
   - `/eat` 公開卡片之搜尋中心一律標記為「預設位置」或「指定坐標」，絕不輸出私人別名。
 - **候選名單記憶體快取（In-Memory Session Cache）**：
-  - 保存每次查詢之候選餐廳清單與下一頁 token（預設搜尋每頁最多 20 家，延遲載入最多 3 頁）。
+  - 保存每次查詢之候選餐廳清單與下一頁 token（每頁最多 20 家，延遲載入最多 3 頁）。
   - Session 數量上限 1000 筆：達上限時先清除過期 Session，仍滿則淘汰最早到期者。
   - 設定 10 分鐘 TTL，並具備背景清理 Goroutine（支援安全多次呼叫 `Stop()`）。
   - 記錄已抽取的店家 ID；重抽時自剩餘候選隨機挑選。
@@ -264,9 +241,9 @@ flowchart TD
 ## 4. 驗收標準清單
 
 - [x] **Google Places API (New)**
-  - [x] `SearchOpenRestaurantsPage` 使用 `POST /v1/places:searchText`、`openNow: true` 與矩形 `locationRestriction`，單次僅載入一頁並回傳 `nextPageToken`
-  - [x] 預設搜尋過濾非餐飲類型店家
-  - [x] `SearchTextRestaurants` 使用 `POST /v1/places:searchText` 並限制 `includedType: "restaurant"` 與 `strictTypeFiltering: true`，支援最多 2 頁分頁過濾
+  - [x] `SearchRestaurantsPage` 使用 `POST /v1/places:searchText`、`openNow: true` 與矩形 `locationRestriction`，單次僅載入一頁並回傳 `nextPageToken`；有無關鍵字共用
+  - [x] 過濾非餐飲類型店家（不使用 `strictTypeFiltering`）
+  - [x] 下一頁沿用第 1 頁之關鍵字與參數
   - [x] 後端實作 Haversine 距離過濾，保證不超出搜尋半徑
   - [x] 僅保留 `currentOpeningHours.openNow == true` 之店家（排除未知與打烊）
   - [x] 依據 API 時區動態解析今日營業時間，無全域寫死時區

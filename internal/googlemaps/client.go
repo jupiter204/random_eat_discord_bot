@@ -8,12 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
 const (
-	defaultFieldMask = "places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
-	textFieldMask    = "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
+	searchFieldMask = "places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
 )
 
 // FoodPlaceTypes 為預設搜尋視為餐飲的店家類型（Google Places Table A）。
@@ -22,15 +22,14 @@ const (
 var FoodPlaceTypes = []string{"restaurant", "cafe", "meal_takeaway", "bakery"}
 
 // Client 定義 Google Places API 用戶端介面
-// 無關鍵字時的預設搜尋設定（Text Search 每頁最多 20 筆）
+// 搜尋設定（Text Search 每頁最多 20 筆）；未指定關鍵字時以 DefaultTextQuery 搜尋
 const (
 	DefaultTextQuery      = "餐廳"
 	defaultSearchPageSize = 20
 )
 
 type Client interface {
-	SearchOpenRestaurantsPage(ctx context.Context, lat, lng float64, radiusMeters int, pageToken string) ([]Place, string, error)
-	SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]Place, error)
+	SearchRestaurantsPage(ctx context.Context, keyword string, lat, lng float64, radiusMeters int, pageToken string) ([]Place, string, error)
 }
 
 type placesClient struct {
@@ -74,60 +73,6 @@ func NewTestClient(apiKey, baseURL string, maxRetries int, baseDelay time.Durati
 	}
 }
 
-// SearchTextRestaurants 搜尋指定關鍵字且位於該坐標偏好範圍內的營業中餐廳 (使用 searchText)
-func (c *placesClient) SearchTextRestaurants(ctx context.Context, query string, lat, lng float64, radiusMeters int) ([]Place, error) {
-	reqBody := TextSearchRequest{
-		TextQuery:           query,
-		IncludedType:        "restaurant",
-		StrictTypeFiltering: true,
-		OpenNow:             true,
-		LocationBias: &LocationBias{
-			Circle: Circle{
-				Center: LatLng{
-					Latitude:  lat,
-					Longitude: lng,
-				},
-				Radius: float64(radiusMeters),
-			},
-		},
-	}
-
-	endpoint := c.baseURL + "/v1/places:searchText"
-	resp, err := c.doPost(ctx, endpoint, reqBody, textFieldMask)
-	if err != nil {
-		return nil, err
-	}
-
-	// 應用層過濾：營業中與指定半徑過濾
-	openPlaces := FilterOpenPlaces(resp.Places)
-	filtered := FilterByRadius(openPlaces, lat, lng, radiusMeters)
-	logFilterStats("text", 1, resp.Places, len(openPlaces), len(filtered))
-
-	// 若第 1 頁候選經半徑過濾後為 0 筆且存在 nextPageToken，最多抓取第 2 頁，避免因 Google API 排序將遠處店家排於首頁導致誤判無結果
-	const maxPages = 2
-	currentPage := 1
-	nextPageToken := resp.NextPageToken
-
-	for len(filtered) == 0 && nextPageToken != "" && currentPage < maxPages {
-		currentPage++
-		pageReq := reqBody
-		pageReq.PageToken = nextPageToken
-
-		pageResp, pageErr := c.doPost(ctx, endpoint, pageReq, textFieldMask)
-		if pageErr != nil {
-			return nil, fmt.Errorf("取得第 %d 頁餐廳失敗: %w", currentPage, pageErr)
-		}
-
-		pageOpen := FilterOpenPlaces(pageResp.Places)
-		pageFiltered := FilterByRadius(pageOpen, lat, lng, radiusMeters)
-		logFilterStats("text", currentPage, pageResp.Places, len(pageOpen), len(pageFiltered))
-		filtered = append(filtered, pageFiltered...)
-		nextPageToken = pageResp.NextPageToken
-	}
-
-	return filtered, nil
-}
-
 // FilterStats 為單次 API 回應在各過濾階段的店家數量，用於診斷候選名單為何變少
 type FilterStats struct {
 	Raw         int // Google 原始回傳筆數
@@ -150,10 +95,10 @@ func ComputeFilterStats(raw []Place, openCount, inRadius int) FilterStats {
 	return st
 }
 
-func logFilterStats(endpoint string, page any, raw []Place, openCount, inRadius int) {
+func logFilterStats(query string, page any, raw []Place, openCount, inRadius int) {
 	st := ComputeFilterStats(raw, openCount, inRadius)
 	slog.Info("Places API 過濾統計",
-		"endpoint", endpoint,
+		"query", query,
 		"page", page,
 		"raw", st.Raw,
 		"open_now", st.OpenNow,
@@ -163,13 +108,19 @@ func logFilterStats(endpoint string, page any, raw []Place, openCount, inRadius 
 	)
 }
 
-// SearchOpenRestaurantsPage 無關鍵字時的預設搜尋（單頁）：以 Text Search 搜尋「餐廳」並由 API 端過濾營業中（openNow），
-// 範圍以涵蓋圓形半徑的矩形硬性限制；回傳前於應用層過濾餐飲類型、營業中與實際半徑。
+// SearchRestaurantsPage 以 Text Search 搜尋營業中餐廳（單頁）。keyword 為空時搜尋「餐廳」，否則搜尋該關鍵字。
+// 由 API 端過濾營業中（openNow），範圍以涵蓋圓形半徑的矩形硬性限制；回傳前於應用層過濾餐飲類型、營業中與實際半徑。
+// 不使用 includedType/strictTypeFiltering：限定單一類型會排除咖啡廳、麵包店等，改由 IsFoodPlace 於應用層判斷。
 // pageToken 為空時取第 1 頁；回傳之 nextPageToken 為空代表已無下一頁（Google 最多提供 3 頁共 60 筆）。
 // 分頁請求必須與第 1 頁使用完全相同的參數，故由本函式統一組裝。
-func (c *placesClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng float64, radiusMeters int, pageToken string) ([]Place, string, error) {
+func (c *placesClient) SearchRestaurantsPage(ctx context.Context, keyword string, lat, lng float64, radiusMeters int, pageToken string) ([]Place, string, error) {
+	query := strings.TrimSpace(keyword)
+	if query == "" {
+		query = DefaultTextQuery
+	}
+
 	reqBody := TextSearchRequest{
-		TextQuery: DefaultTextQuery,
+		TextQuery: query,
 		OpenNow:   true,
 		PageSize:  defaultSearchPageSize,
 		PageToken: pageToken,
@@ -178,7 +129,7 @@ func (c *placesClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng f
 		},
 	}
 
-	resp, err := c.doPost(ctx, c.baseURL+"/v1/places:searchText", reqBody, defaultFieldMask)
+	resp, err := c.doPost(ctx, c.baseURL+"/v1/places:searchText", reqBody, searchFieldMask)
 	if err != nil {
 		return nil, "", err
 	}
@@ -186,9 +137,9 @@ func (c *placesClient) SearchOpenRestaurantsPage(ctx context.Context, lat, lng f
 	food := FilterFoodPlaces(resp.Places)
 	open := FilterOpenPlaces(food)
 	inRadius := FilterByRadius(open, lat, lng, radiusMeters)
-	logFilterStats("text-default", pageLabel(pageToken), resp.Places, len(open), len(inRadius))
+	logFilterStats(query, pageLabel(pageToken), resp.Places, len(open), len(inRadius))
 	if dropped := len(resp.Places) - len(food); dropped > 0 {
-		slog.Info("排除非餐飲類型店家", "count", dropped)
+		slog.Info("排除非餐飲類型店家", "query", query, "count", dropped)
 	}
 
 	return inRadius, resp.NextPageToken, nil

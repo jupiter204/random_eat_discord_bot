@@ -206,17 +206,6 @@ type LatLng struct {
 	Longitude float64 `json:"longitude"`
 }
 
-// Circle 代表地理圓形區域限制
-type Circle struct {
-	Center LatLng  `json:"center"`
-	Radius float64 `json:"radius"`
-}
-
-// LocationBias 搜尋偏好結構（用於 searchText）
-type LocationBias struct {
-	Circle Circle `json:"circle"`
-}
-
 // Viewport 以西南角（Low）與東北角（High）表示的矩形範圍
 type Viewport struct {
 	Low  LatLng `json:"low"`
@@ -246,15 +235,12 @@ func BoundingRectangle(lat, lng float64, radiusMeters int) Viewport {
 	}
 }
 
-// TextSearchRequest Places API (New) searchText 請求（locationBias 與 locationRestriction 擇一使用）
+// TextSearchRequest Places API (New) searchText 請求
 type TextSearchRequest struct {
 	TextQuery           string                `json:"textQuery"`
-	IncludedType        string                `json:"includedType,omitempty"`
-	StrictTypeFiltering bool                  `json:"strictTypeFiltering,omitempty"`
 	OpenNow             bool                  `json:"openNow"`
 	PageSize            int                   `json:"pageSize,omitempty"`
 	PageToken           string                `json:"pageToken,omitempty"`
-	LocationBias        *LocationBias         `json:"locationBias,omitempty"`
 	LocationRestriction *RectangleRestriction `json:"locationRestriction,omitempty"`
 }
 
