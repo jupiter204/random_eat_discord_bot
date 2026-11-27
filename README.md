@@ -10,11 +10,11 @@
 - 💸 **API 呼叫與成本最佳化**：
     - **純座標定位**：使用者直接輸入經緯度，省去 Geocoding 地址轉換費用。
     - **單次搜尋與 Session 快取**：初次搜尋批次取得候選餐廳並快取於記憶體（10 分鐘 TTL），同一 `/eat` Session 的 Reroll 使用已取得的候選集合，**不會因每次 Reroll 再次呼叫 Google Places API**。
-    - **欄位遮罩 (Field Mask)**：使用精確的端點專屬 Field Mask（Text Search 包含 `nextPageToken`，Nearby Search 則不包含）控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
+    - **欄位遮罩 (Field Mask)**：使用精確的端點專屬 Field Mask（預設搜尋額外請求 `places.types` 以過濾餐飲類型，兩種 Text Search 皆包含 `nextPageToken`）控管 Places API 回傳欄位，避免拉取未使用的非必要資料。
 - 🕔 **明確營業中過濾**：系統會使用 Google Places API 提供的 `currentOpeningHours.openNow` 判斷目前營業狀態，只保留 API 明確標示為營業中的餐廳；營業狀態未知的店家會排除。
 - 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應當地營業時間。
 - 🎯 **搜尋流程與半徑保證**：
-    - **無 keyword 搜尋**：呼叫 Nearby Search (`POST /v1/places:searchNearby`)，透過 `locationRestriction` 限制圓形區域，Request 不包含 `openNow` 欄位；由 API 回傳 `currentOpeningHours` 後在應用層過濾 `openNow == true`。
+    - **無 keyword 搜尋**：呼叫 Text Search (`POST /v1/places:searchText`)，`textQuery: 餐廳`、`openNow: true`（由 API 端過濾營業中），以涵蓋搜尋半徑的矩形 `locationRestriction` 硬性限制範圍，每頁 20 筆；應用層再過濾餐飲類型（restaurant、cafe、meal_takeaway、bakery 及各 `*_restaurant` 子類型）、營業中與 Haversine 實際半徑。**延遲分頁**：`/eat` 只載入第 1 頁（若過濾後為 0 筆才往下翻），「再抽一家」抽完這頁時才載入下一頁，最多 3 頁（60 筆）；同一 Session 同時只會有一個請求載入下一頁。
     - **有 keyword 搜尋**：呼叫 Text Search (`POST /v1/places:searchText`)，設定 `includedType: restaurant`、`strictTypeFiltering: true`、`openNow: true` 與 `locationBias`；後端再以 Haversine 大圓距離公式進行嚴格過濾，保證最終回傳餐廳不超過指定半徑。若第 1 頁在半徑內為 0 筆，最多延伸翻查至第 2 頁，避免熱門遠端店家擠佔首頁。
 - 🎲 **客觀隨機抽選**：隨機選擇範圍是 Google Places API 搜尋並通過應用程式條件篩選後的候選集合，而非保證涵蓋指定半徑內所有餐廳。
 - 🔒 **隱私防護**：
@@ -36,15 +36,15 @@
  │
  ├─ 無 keyword
  │      ↓
- │   Nearby Search (New) (POST /v1/places:searchNearby)
+ │   Text Search (New) (POST /v1/places:searchText)，只載入第 1 頁
  │      ↓
- │   includedTypes: ["restaurant"], locationRestriction: circle (Request 不含 openNow)
+ │   textQuery: "餐廳", openNow: true, pageSize: 20, locationRestriction: 外接矩形
  │      ↓
- │   API Response 取得 currentOpeningHours & location
+ │   應用層過濾：餐飲類型 && currentOpeningHours.openNow == true && Haversine 距離 <= radius
  │      ↓
- │   應用層過濾：currentOpeningHours.openNow == true && Haversine 距離 <= radius
+ │   隨機抽取 1 家，其餘候選與 nextPageToken 存入 Session Cache (10m TTL)
  │      ↓
- │   隨機抽取 1 家，其餘候選存入 Session Cache (10m TTL)
+ │   「再抽一家」抽完本頁時才載入下一頁（最多 3 頁 / 60 家）
  │
  └─ 有 keyword (例如拉麵)
         ↓
@@ -66,7 +66,7 @@
 - **程式語言**：Go 1.24+
 - **Discord SDK**：[`bwmarrin/discordgo`](https://github.com/bwmarrin/discordgo)
 - **資料持久化**：[`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite)（純 Go 驅動，跨平台、零 CGO）
-- **地理資訊服務**：Google Places API (New)（`searchNearby` & `searchText`）
+- **地理資訊服務**：Google Places API (New)（`searchText`）
 - **容器環境**：Podman / Docker（基於 Alpine Linux runtime）
 
 ---
@@ -77,6 +77,8 @@
 | :------ | :------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- |
 | `/set`  | 設定個人的預設搜尋座標與半徑     | `latitude` (必填/緯度)<br>`longitude` (必填/經度)<br>`radius` (選填/搜尋半徑公尺，預設 1000m)<br>`name` (選填/位置別名，如「公司」)                      | 🔒 私密訊息 (僅自己可見) |
 | `/eat`  | 隨機抽取營業中的餐廳             | `keyword` (選填/指定餐點種類，如「拉麵」、「火鍋」)<br>`latitude` (選填/臨時指定緯度)<br>`longitude` (選填/臨時指定經度)<br>`radius` (選填/覆蓋預設半徑)     | 📢 公開頻道訊息          |
+| `/eat-list` | （限指定測試者）列出抽籤候選名單的全部餐廳，依距離排序；僅在設定 `EAT_LIST_ALLOWED_USERS` 時註冊 | 同 `/eat` | 🔒 私密訊息 (僅自己可見) |
+| `/unset` | 刪除已儲存的個人預設座標       | 無                                                                                                                                                       | 🔒 私密訊息 (僅自己可見) |
 | `/help` | 查看機器人功能教學與座標取得方式 | 無                                                                                                                                                       | 🔒 私密訊息              |
 
 > ⚠️ **坐標輸入注意**：在 `/eat` 中若要自訂坐標，`latitude` 與 `longitude` 必須成對提供；若皆未提供則自動套用 `/set` 儲存的個人預設位置。
@@ -101,6 +103,9 @@ GOOGLE_MAPS_API_KEY=your_google_cloud_api_key
 
 # SQLite 資料庫位置
 DB_PATH=/app/data/random_eat.db
+
+# （選填）允許使用 /eat-list 測試指令的 Discord 使用者 ID，多個以逗號分隔；留空則不註冊該指令
+EAT_LIST_ALLOWED_USERS=
 ```
 
 ---
@@ -186,7 +191,7 @@ random_eat_discord/
 │   │   ├── models.go              # UserPreference 資料模型
 │   │   └── repository.go          # 使用者偏好 CRUD 實作
 │   ├── googlemaps/
-│   │   ├── client.go              # Places API (New) searchNearby / searchText 與重試機制
+│   │   ├── client.go              # Places API (New) searchText（預設搜尋與關鍵字搜尋）與重試機制
 │   │   ├── client_test.go         # API Client 單元與 Mock 測試
 │   │   ├── models.go              # Places API 資料結構、時區解析與 Haversine 距離過濾
 │   │   └── models_test.go         # 資料模型與營業狀態測試

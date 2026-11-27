@@ -17,7 +17,7 @@
 - **程式語言**：Go 1.24+
 - **Discord SDK**：`github.com/bwmarrin/discordgo`
 - **資料庫**：純 Go SQLite 驅動 `modernc.org/sqlite`（無須 CGO）
-- **地理資訊服務**：Google Places API (New)（`searchNearby` & `searchText`）
+- **地理資訊服務**：Google Places API (New)（`searchText`）
 
 ---
 
@@ -42,18 +42,18 @@ flowchart TD
     UsePrefCoord --> PlacesSearch
 
     subgraph GooglePlaces["Google Places API (New) (Timeout: 10s, Retry: 429/5xx)"]
-        PlacesSearch --> TextOrNearby{"是否有指定食物關鍵字?"}
-        TextOrNearby -- 無 (純附近) --> NearbyAPI["searchNearby (restaurant, maxResultCount: 20, locationRestriction)"]
-        TextOrNearby -- 有 (指定品項) --> TextAPI["searchText (restaurant, strictTypeFiltering: true, openNow: true, locationBias)"]
+        PlacesSearch --> HasKeyword{"是否有指定食物關鍵字?"}
+        HasKeyword -- 無 (預設搜尋) --> DefaultAPI["searchText (textQuery: 餐廳, openNow: true, pageSize: 20, 矩形 locationRestriction, 僅載入第 1 頁)"]
+        HasKeyword -- 有 (指定品項) --> TextAPI["searchText (restaurant, strictTypeFiltering: true, openNow: true, locationBias)"]
     end
 
-    NearbyAPI --> FilterPhase["應用層過濾：currentOpeningHours.openNow == true + Haversine 距離 <= 半徑"]
+    DefaultAPI --> FilterPhase["應用層過濾：餐飲類型 (僅預設搜尋) + currentOpeningHours.openNow == true + Haversine 距離 <= 半徑"]
     TextAPI --> FilterPhase
 
     FilterPhase --> LotteryService["抽籤調度與暫存 (Lottery Service)"]
 
     subgraph MemoryCache["In-Memory Session 快取 (10 min TTL)"]
-        LotteryService --> StoreCandidates["存入候選餐廳清單 (最多 20 家)"]
+        LotteryService --> StoreCandidates["存入候選餐廳清單與下一頁 token (上限 1000 個 Session)"]
         StoreCandidates --> PickOne["隨機抽取 1 家"]
     end
 
@@ -64,7 +64,9 @@ flowchart TD
         ClickReroll["點擊按鈕"] --> CheckMemCache{"檢查 Session 暫存清單"}
         CheckMemCache -- 尚有未抽店家 --> PickNext["自記憶體抽取下一家 (零 API 費用)"]
         PickNext --> UpdateEmbed["更新原始 Embed 訊息"]
-        CheckMemCache -- 候選名單抽完 --> ExhaustedMsg["提示候選餐廳已用罄，停用按鈕"]
+        CheckMemCache -- 本頁抽完且有下一頁 --> LoadNext["載入下一頁 (1 次 API，同 Session 同時僅一個請求)"]
+        LoadNext --> PickNext
+        CheckMemCache -- 全部抽完且無下一頁 --> ExhaustedMsg["提示候選餐廳已用罄，停用按鈕"]
         CheckMemCache -- 已過期/不存在 --> ExpiredMsg["提示清單已過期，請重新輸入 /eat"]
     end
 ```
@@ -129,23 +131,30 @@ flowchart TD
   - 超時時間：統一為 **10 秒**。
   - 重試策略：針對 429 (Too Many Requests)、500、502、503、504 與暫態網路連線異常進行最多 2 次重試（指數退避：100ms, 200ms）。
   - 不可重試錯誤：400、401、403、404 等客戶端錯誤立即中斷並回報，不進行無意義重試。
-- **API 模式 A：純周邊探索（searchNearby）**：
-  - 端點：`POST https://places.googleapis.com/v1/places:searchNearby`
+- **API 模式 A：預設搜尋（searchText + openNow，延遲分頁）**：
+  - 端點：`POST https://places.googleapis.com/v1/places:searchText`
   - 適用：未輸入食物關鍵字，直接隨機抽附近營業中的餐廳。
-  - Payload（**注意：Places API (New) 之 searchNearby Request 不支援且不包含 openNow 欄位**）：
+  - 採用 Text Search 而非 Nearby Search 之原因：Nearby Search (New) 不支援 `openNow` 請求參數且最多僅回傳 20 筆、無分頁；Text Search 可由 API 端過濾營業中，並支援最多 3 頁（共 60 筆）。
+  - Payload（searchText 之 `locationRestriction` 僅支援矩形，以涵蓋搜尋圓形之外接矩形（放大 1% 緩衝）硬性限制範圍）：
     ```json
     {
-      "includedTypes": ["restaurant"],
-      "maxResultCount": 20,
+      "textQuery": "餐廳",
+      "openNow": true,
+      "pageSize": 20,
       "locationRestriction": {
-        "circle": {
-          "center": { "latitude": 25.0339, "longitude": 121.5644 },
-          "radius": 1000.0
+        "rectangle": {
+          "low":  { "latitude": 25.02481, "longitude": 121.55448 },
+          "high": { "latitude": 25.04299, "longitude": 121.57432 }
         }
       }
     }
     ```
-  - 營業狀態過濾：透過 Field Mask 請求 `places.currentOpeningHours`，回傳後由應用程式端過濾 `currentOpeningHours.openNow == true`。
+  - 餐飲類型過濾：透過 Field Mask 請求 `places.types`，僅保留 `restaurant`、`cafe`、`meal_takeaway`、`bakery` 或任何 `*_restaurant` 子類型之店家。
+  - 延遲分頁（Lazy Pagination）：
+    - `/eat` 僅載入第 1 頁；若第 1 頁過濾後為 0 筆且存在 `nextPageToken`，才繼續往下載入，避免誤判無結果。
+    - `nextPageToken` 存入 Session；Reroll 抽完目前候選且仍有下一頁時，才使用 `pageToken` 載入下一頁（其餘參數與第 1 頁完全相同），新店家依 place ID 去重後附加至候選名單。
+    - 同一 Session 同時僅允許一個請求載入下一頁，其他並行點擊回傳 `ErrLoadingMore`（「正在載入更多餐廳，請稍後再按一次」）；載入失敗時保留 token 供重試。
+    - 最多 3 頁，達上限後視為無下一頁。
 - **API 模式 B：特定餐點搜尋（searchText）**：
   - 端點：`POST https://places.googleapis.com/v1/places:searchText`
   - 適用：使用者指定餐點/關鍵字（如「拉麵」、「火鍋」）。
@@ -166,7 +175,7 @@ flowchart TD
     ```
   - 分頁機制（Pagination）：若第 1 頁候選經半徑過濾後為 0 筆且存在 `nextPageToken`，最多使用 `pageToken` 額外抓取至第 2 頁，避免因 Google API 排序將遠處熱門店家排於首頁導致誤判無結果；若分頁請求失敗則將錯誤回傳上層，不靜默吞掉。
 - **搜尋半徑保證（Haversine 距離過濾）**：
-  - Nearby Search 透過 `locationRestriction` 限制圓形區域。
+  - 預設搜尋透過矩形 `locationRestriction` 限制範圍，矩形四角超出圓形半徑之店家由 Haversine 過濾剃除。
   - Text Search 透過 `locationBias` 搜尋候選，後端再以 Haversine 公式依實際經緯度計算店家與搜尋中心直線大圓距離：
     $$\text{distance} \le \text{radiusMeters}$$
   - 超出半徑者全數剃除，保證 `/eat radius=X` 回傳店家絕不超出指定半徑。
@@ -176,8 +185,8 @@ flowchart TD
   - 依據 API 回傳之 `places.timeZone`（IANA ID 如 `Asia/Taipei`）或 `places.utcOffsetMinutes` 解析店家當地時間，對應精確今日星期，非硬編碼單一時區。
 - **Field Mask 與語系設定**：
   - Header `X-Goog-FieldMask`（端點專屬設定）：
-    - Nearby Search：`places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone`
-    - Text Search：`places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
+    - 預設搜尋：`places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
+    - 關鍵字搜尋：`places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
   - Header `X-Goog-Language-Code: zh-TW`
   - Header `X-Goog-Api-Key: {GOOGLE_MAPS_API_KEY}`
 
@@ -194,10 +203,11 @@ flowchart TD
   - 使用者在 `/set` 儲存的自訂名稱（如「公司」、「我家」）僅儲存於資料庫供個人識別。
   - `/eat` 公開卡片之搜尋中心一律標記為「預設位置」或「指定坐標」，絕不輸出私人別名。
 - **候選名單記憶體快取（In-Memory Session Cache）**：
-  - 保存每次查詢之候選餐廳清單（最多 20 家）。
+  - 保存每次查詢之候選餐廳清單與下一頁 token（預設搜尋每頁最多 20 家，延遲載入最多 3 頁）。
+  - Session 數量上限 1000 筆：達上限時先清除過期 Session，仍滿則淘汰最早到期者。
   - 設定 10 分鐘 TTL，並具備背景清理 Goroutine（支援安全多次呼叫 `Stop()`）。
   - 記錄已抽取的店家 ID；重抽時自剩餘候選隨機挑選。
-  - **非循環終止語意**：當所有候選皆已抽出時，回傳 `ErrNoMoreCandidates`（「沒有更多候選餐廳，請重新使用 /eat」），不無限循環重抽先前看過的店家。
+  - **非循環終止語意**：當所有候選皆已抽出且沒有下一頁時，回傳 `ErrNoMoreCandidates`（「沒有更多候選餐廳，請重新使用 /eat」），不無限循環重抽先前看過的店家。
 - **隨機演算法**：使用 Go 標準庫 `math/rand/v2`。
 
 ---
@@ -209,23 +219,35 @@ flowchart TD
      - `latitude`（緯度，Number，必填，例如 `25.0339`）
      - `longitude`（經度，Number，必填，例如 `121.5644`）
      - `radius`（搜尋半徑_公尺，Integer，選填，預設 1000，範圍 100~5000）
-     - `name`（位置別名，String，選填，例如「公司」、「家」）
+     - `name`（位置別名，String，選填，最多 32 字，例如「公司」、「家」）
      - 回應模式：`MessageFlagsEphemeral`（私密訊息，保護隱私）。
   2. `/eat`（隨機抽餐廳）：
-     - `keyword`（食物種類或關鍵字，String，選填，例如「拉麵」）
+     - `keyword`（食物種類或關鍵字，String，選填，最多 50 字，例如「拉麵」）
      - `latitude`（緯度，Number，選填，需與 longitude 同時提供）
      - `longitude`（經度，Number，選填，需與 latitude 同時提供）
      - `radius`（搜尋半徑_公尺，Integer，選填，覆蓋預設半徑）
-     - 回應模式：公開頻道訊息。
-  3. `/help`（指令教學與坐標取得方式說明）：
+     - 回應模式：公開頻道訊息；失敗時刪除公開的 Deferred 訊息，改以 Ephemeral 訊息回報錯誤。
+  3. `/unset`（刪除個人預設坐標）：
+     - 回應模式：`MessageFlagsEphemeral`。
+  4. `/eat-list`（測試用，列出完整候選名單）：
+     - 參數同 `/eat`，與 `/eat` 共用搜尋邏輯，依距離排序，回應模式為 Ephemeral。
+     - 僅限 `EAT_LIST_ALLOWED_USERS`（逗號分隔之 Discord 使用者 ID）內的使用者使用；其他使用者收到 Ephemeral 無權限提示且不呼叫 API。
+     - 未設定 `EAT_LIST_ALLOWED_USERS` 時不註冊此指令。
+  5. `/help`（指令教學與坐標取得方式說明）：
      - 說明如何從 Google 地圖 App/網頁版長按點選以複製經緯度坐標。
+- **指令註冊**：使用 `ApplicationCommandBulkOverwrite` 完整取代既有指令集，停用或移除之指令不會殘留。
+- **錯誤處理與穩定性**：
+  - `HandleInteraction` 攔截 panic，避免單一互動錯誤導致程序崩潰。
+  - 僅顯示預定義之使用者錯誤訊息；內部錯誤（DB、Google API 回應）只記錄於 log。
+  - Embed 標題、說明、欄位與 footer 依 Discord 長度上限截斷，空值改用預設文字。
 - **Interaction 逾時防禦**：
   - 收到指令第一時間發送 `InteractionResponseDeferredChannelMessageWithSource`。
   - 運算完成後呼叫 `InteractionResponseEdit` 更新為抽籤結果卡片。
 - **Reroll 互動與權限語意**：
   - 按鈕規格：`CustomID: reroll:<session_id>`，`Style: PrimaryButton`。
   - 權限模型：**頻道共同決策**模式，任何能看到該訊息之成員皆可點擊重抽，卡片會即時更新並註明最新點擊者。
-  - 當候選名單剩餘 0 家時，按鈕自動標記為 `Disabled: true` 且標籤轉為「已無更多備選餐廳」。
+  - 當目前候選剩餘 0 家但仍有下一頁時，按鈕維持可點擊，標籤轉為「🔄 再抽一家 (將載入更多餐廳)」，提示下次點擊將呼叫 API。
+  - 當候選名單剩餘 0 家且沒有下一頁時，按鈕自動標記為 `Disabled: true` 且標籤轉為「已無更多備選餐廳」。
   - 若已過期或無更多候選，以 Ephemeral 訊息提示原因，避免污染頻道。
 - **Discord Rich Embed 卡片排版**：
   - **Title**：`🍽️ [餐廳名稱]`（附 Google Maps 超連結）
@@ -242,7 +264,8 @@ flowchart TD
 ## 4. 驗收標準清單
 
 - [x] **Google Places API (New)**
-  - [x] `SearchNearbyRestaurants` 真正使用 `POST /v1/places:searchNearby`，Request 絕不含 `openNow` 欄位
+  - [x] `SearchOpenRestaurantsPage` 使用 `POST /v1/places:searchText`、`openNow: true` 與矩形 `locationRestriction`，單次僅載入一頁並回傳 `nextPageToken`
+  - [x] 預設搜尋過濾非餐飲類型店家
   - [x] `SearchTextRestaurants` 使用 `POST /v1/places:searchText` 並限制 `includedType: "restaurant"` 與 `strictTypeFiltering: true`，支援最多 2 頁分頁過濾
   - [x] 後端實作 Haversine 距離過濾，保證不超出搜尋半徑
   - [x] 僅保留 `currentOpeningHours.openNow == true` 之店家（排除未知與打烊）
@@ -254,7 +277,12 @@ flowchart TD
   - [x] Session Cache 抽完即止，不無限循環重複
   - [x] Session Cache `Stop()` 具備等冪性（sync.Once 防 panic）
   - [x] Session Cache 支援高並行存取安全性（零 Data Race）
+  - [x] 延遲分頁：Reroll 抽完才載入下一頁，同 Session 並行點擊僅呼叫一次 API，失敗可重試
+  - [x] Session 數量上限與淘汰策略
 - [x] **Discord 互動層**
   - [x] Deferred Interaction 防 3 秒逾時
-  - [x] Reroll 支援頻道共同決策，用罄時停用按鈕
+  - [x] Reroll 支援頻道共同決策，用罄且無下一頁時停用按鈕
+  - [x] `/eat-list` 僅限允許名單使用者
+  - [x] 字串參數長度限制與 Embed 長度截斷
+  - [x] 內部錯誤不外洩給使用者
   - [x] 完整測試覆蓋各模組

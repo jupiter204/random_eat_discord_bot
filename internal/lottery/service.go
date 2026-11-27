@@ -5,14 +5,25 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"random_eat_discord/internal/db"
 	"random_eat_discord/internal/googlemaps"
 )
 
+// 字串輸入長度上限（以字元計），同時用於 Slash Command 的 MaxLength 設定
+const (
+	MaxLocationNameLength = 32
+	MaxKeywordLength      = 50
+)
+
 var (
+	ErrNameTooLong            = fmt.Errorf("位置別名最多 %d 個字", MaxLocationNameLength)
+	ErrKeywordTooLong         = fmt.Errorf("關鍵字最多 %d 個字", MaxKeywordLength)
 	ErrNoPreference           = errors.New("尚未設定預設位置，請先使用 `/set` 指令或在 `/eat` 帶入坐標")
 	ErrNoRestaurants          = errors.New("在指定範圍內找不到營業中的餐廳，請嘗試擴大半徑或更換坐標")
 	ErrInvalidCoordinate      = errors.New("坐標格式不正確 (緯度範圍: -90~90, 經度範圍: -180~180)")
@@ -20,6 +31,7 @@ var (
 	ErrCoordinatePairRequired = errors.New("latitude 與 longitude 必須同時提供")
 	ErrSessionExpired         = errors.New("抽籤清單已過期或不存在，請重新輸入 `/eat` 進行抽籤")
 	ErrNoMoreCandidates       = errors.New("沒有更多候選餐廳，請重新使用 /eat")
+	ErrLoadingMore            = errors.New("正在載入更多餐廳，請稍後再按一次")
 )
 
 // DrawRequest 抽籤請求參數
@@ -38,15 +50,44 @@ type DrawResult struct {
 	Place          *googlemaps.Place
 	RemainingCount int
 	TotalCount     int
-	QueryCtx       QueryContext
+	// HasMore 為 true 代表目前這頁抽完後還能向 Google 載入下一頁
+	HasMore  bool
+	QueryCtx QueryContext
+}
+
+// maxSearchPages Google Text Search 最多提供 3 頁（共 60 筆）
+const maxSearchPages = 3
+
+// searchOutcome 為一次搜尋的候選名單與分頁狀態
+type searchOutcome struct {
+	places        []googlemaps.Place
+	nextPageToken string
+	pagesLoaded   int
+	qCtx          QueryContext
+}
+
+// Candidate 候選餐廳與其距搜尋中心的距離（無坐標時為 -1）
+type Candidate struct {
+	Place          googlemaps.Place
+	DistanceMeters float64
+}
+
+// ListResult 完整候選名單
+type ListResult struct {
+	Candidates []Candidate
+	// HasMore 為 true 代表 Google 還有下一頁（/eat 抽完這頁後會再載入）
+	HasMore  bool
+	QueryCtx QueryContext
 }
 
 // Service 抽籤核心領域介面
 type Service interface {
 	Draw(ctx context.Context, req DrawRequest) (*DrawResult, error)
 	Reroll(ctx context.Context, sessionID string) (*DrawResult, error)
-	SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) error
+	List(ctx context.Context, req DrawRequest) (*ListResult, error)
+	SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) (*db.UserPreference, error)
 	GetPreference(ctx context.Context, userID string) (*db.UserPreference, error)
+	DeletePreference(ctx context.Context, userID string) error
 	Close()
 }
 
@@ -84,16 +125,20 @@ func ValidateRadius(radius int) error {
 	return nil
 }
 
-// SetPreference 設定使用者預設位置與搜尋半徑
-func (s *lotteryService) SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) error {
+// SetPreference 設定使用者預設位置與搜尋半徑，成功時回傳實際寫入的設定值
+func (s *lotteryService) SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) (*db.UserPreference, error) {
 	if err := ValidateCoordinates(lat, lng); err != nil {
-		return err
+		return nil, err
 	}
 	if radius <= 0 {
 		radius = 1000
 	}
 	if err := ValidateRadius(radius); err != nil {
-		return err
+		return nil, err
+	}
+	name = strings.TrimSpace(name)
+	if utf8.RuneCountInString(name) > MaxLocationNameLength {
+		return nil, ErrNameTooLong
 	}
 
 	pref := &db.UserPreference{
@@ -103,7 +148,15 @@ func (s *lotteryService) SetPreference(ctx context.Context, userID, name string,
 		Longitude:    lng,
 		Radius:       radius,
 	}
-	return s.repo.UpsertPreference(ctx, pref)
+	if err := s.repo.UpsertPreference(ctx, pref); err != nil {
+		return nil, err
+	}
+	return pref, nil
+}
+
+// DeletePreference 刪除使用者儲存的預設位置
+func (s *lotteryService) DeletePreference(ctx context.Context, userID string) error {
+	return s.repo.DeletePreference(ctx, userID)
 }
 
 // GetPreference 取得使用者預設位置
@@ -113,92 +166,18 @@ func (s *lotteryService) GetPreference(ctx context.Context, userID string) (*db.
 
 // Draw 執行餐廳抽籤
 func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult, error) {
-	// 經緯度若提供則必須成對提供
-	if (req.Latitude != nil && req.Longitude == nil) || (req.Latitude == nil && req.Longitude != nil) {
-		return nil, ErrCoordinatePairRequired
-	}
-
-	var targetLat, targetLng float64
-	var targetRadius int
-	var isCustomCoord bool
-	var locationName string
-
-	// 1. 解析坐標與半徑：優先採用即時輸入，次之查詢 DB 偏好
-	if req.Latitude != nil && req.Longitude != nil {
-		if err := ValidateCoordinates(*req.Latitude, *req.Longitude); err != nil {
-			return nil, err
-		}
-		targetLat = *req.Latitude
-		targetLng = *req.Longitude
-		isCustomCoord = true
-		locationName = "指定坐標"
-
-		if req.Radius != nil {
-			if err := ValidateRadius(*req.Radius); err != nil {
-				return nil, err
-			}
-			targetRadius = *req.Radius
-		} else {
-			targetRadius = 1000
-		}
-	} else {
-		// 查詢使用者偏好
-		pref, err := s.repo.GetPreference(ctx, req.UserID)
-		if err != nil {
-			return nil, fmt.Errorf("查詢使用者偏好失敗: %w", err)
-		}
-		if pref == nil {
-			return nil, ErrNoPreference
-		}
-
-		targetLat = pref.Latitude
-		targetLng = pref.Longitude
-		isCustomCoord = false
-		// 隱私保護：在公開抽籤結果一律使用非私人語意標籤，不輸出使用者自訂的私人位置名稱（如「我家」）
-		locationName = "預設位置"
-
-		if req.Radius != nil {
-			if err := ValidateRadius(*req.Radius); err != nil {
-				return nil, err
-			}
-			targetRadius = *req.Radius
-		} else {
-			targetRadius = pref.Radius
-		}
-	}
-
-	// 2. 呼叫 Google Places API (New)
-	var places []googlemaps.Place
-	var err error
-	if req.Keyword != "" {
-		places, err = s.mapsClient.SearchTextRestaurants(ctx, req.Keyword, targetLat, targetLng, targetRadius)
-	} else {
-		places, err = s.mapsClient.SearchNearbyRestaurants(ctx, targetLat, targetLng, targetRadius)
-	}
-
+	out, err := s.searchCandidates(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("搜尋餐廳失敗: %w", err)
+		return nil, err
 	}
+	places, qCtx := out.places, out.qCtx
 
-	if len(places) == 0 {
-		return nil, ErrNoRestaurants
-	}
-
-	// 3. 建立 Session 並存入快取 (TTL: 10 分鐘)
+	// 建立 Session 並存入快取 (TTL: 10 分鐘)，一併記錄下一頁 token 供 Reroll 抽完時載入
 	sessionID := uuid.New().String()
-	qCtx := QueryContext{
-		Keyword:       req.Keyword,
-		Latitude:      targetLat,
-		Longitude:     targetLng,
-		Radius:        targetRadius,
-		LocationName:  locationName,
-		IsCustomCoord: isCustomCoord,
-		Initiator:     req.InitiatorName,
-	}
-
 	s.sessionCache.Store(sessionID, places, qCtx, 10*time.Minute)
+	s.sessionCache.SetNextPage(sessionID, out.nextPageToken, out.pagesLoaded)
 
-	// 4. 抽取第 1 家
+	// 抽取第 1 家
 	chosen, remaining, _, err := s.sessionCache.PickNext(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("抽取餐廳失敗: %w", err)
@@ -209,13 +188,164 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 		Place:          chosen,
 		RemainingCount: remaining,
 		TotalCount:     len(places),
+		HasMore:        out.nextPageToken != "",
 		QueryCtx:       qCtx,
 	}, nil
 }
 
-// Reroll 自記憶體 Session 中重抽下一家 (不花費 API 額度)
+// List 回傳與 Draw 相同條件下的完整候選名單（依距離由近到遠排序），不建立 Session，供測試檢視用
+func (s *lotteryService) List(ctx context.Context, req DrawRequest) (*ListResult, error) {
+	out, err := s.searchCandidates(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	places, qCtx := out.places, out.qCtx
+
+	candidates := make([]Candidate, 0, len(places))
+	for _, p := range places {
+		dist := -1.0
+		if p.Location != nil {
+			dist = googlemaps.Haversine(qCtx.Latitude, qCtx.Longitude, p.Location.Latitude, p.Location.Longitude)
+		}
+		candidates = append(candidates, Candidate{Place: p, DistanceMeters: dist})
+	}
+	// 依距離由近到遠，無坐標者排在最後
+	sort.SliceStable(candidates, func(i, j int) bool {
+		di, dj := candidates[i].DistanceMeters, candidates[j].DistanceMeters
+		if (di < 0) != (dj < 0) {
+			return dj < 0
+		}
+		return di < dj
+	})
+
+	return &ListResult{Candidates: candidates, HasMore: out.nextPageToken != "", QueryCtx: qCtx}, nil
+}
+
+// searchCandidates 解析坐標與半徑並呼叫 Google Places API，回傳抽籤候選名單（Draw 與 List 共用，確保兩者名單一致）
+func (s *lotteryService) searchCandidates(ctx context.Context, req DrawRequest) (searchOutcome, error) {
+	// 經緯度若提供則必須成對提供
+	if (req.Latitude != nil && req.Longitude == nil) || (req.Latitude == nil && req.Longitude != nil) {
+		return searchOutcome{}, ErrCoordinatePairRequired
+	}
+	if utf8.RuneCountInString(req.Keyword) > MaxKeywordLength {
+		return searchOutcome{}, ErrKeywordTooLong
+	}
+
+	var targetLat, targetLng float64
+	var targetRadius int
+	var isCustomCoord bool
+	var locationName string
+
+	// 1. 解析坐標與半徑：優先採用即時輸入，次之查詢 DB 偏好
+	if req.Latitude != nil && req.Longitude != nil {
+		if err := ValidateCoordinates(*req.Latitude, *req.Longitude); err != nil {
+			return searchOutcome{}, err
+		}
+		targetLat = *req.Latitude
+		targetLng = *req.Longitude
+		isCustomCoord = true
+		locationName = "指定坐標"
+
+		if req.Radius != nil {
+			if err := ValidateRadius(*req.Radius); err != nil {
+				return searchOutcome{}, err
+			}
+			targetRadius = *req.Radius
+		} else {
+			targetRadius = 1000
+		}
+	} else {
+		// 查詢使用者偏好
+		pref, err := s.repo.GetPreference(ctx, req.UserID)
+		if err != nil {
+			return searchOutcome{}, fmt.Errorf("查詢使用者偏好失敗: %w", err)
+		}
+		if pref == nil {
+			return searchOutcome{}, ErrNoPreference
+		}
+
+		targetLat = pref.Latitude
+		targetLng = pref.Longitude
+		isCustomCoord = false
+		// 隱私保護：在公開抽籤結果一律使用非私人語意標籤，不輸出使用者自訂的私人位置名稱（如「我家」）
+		locationName = "預設位置"
+
+		if req.Radius != nil {
+			if err := ValidateRadius(*req.Radius); err != nil {
+				return searchOutcome{}, err
+			}
+			targetRadius = *req.Radius
+		} else {
+			targetRadius = pref.Radius
+		}
+	}
+
+	// 2. 呼叫 Google Places API (New)
+	//    有關鍵字：Text Search（自帶分頁邏輯，不延遲載入）
+	//    無關鍵字：預設搜尋只取第 1 頁，下一頁留待 Reroll 抽完時再載入以節省 API 呼叫
+	var places []googlemaps.Place
+	var nextPageToken string
+	pagesLoaded := 1
+	var err error
+	if req.Keyword != "" {
+		places, err = s.mapsClient.SearchTextRestaurants(ctx, req.Keyword, targetLat, targetLng, targetRadius)
+	} else {
+		places, nextPageToken, pagesLoaded, err = s.fetchUntilNonEmpty(ctx, targetLat, targetLng, targetRadius, "", 0)
+	}
+
+	if err != nil {
+		return searchOutcome{}, fmt.Errorf("搜尋餐廳失敗: %w", err)
+	}
+
+	if len(places) == 0 {
+		return searchOutcome{}, ErrNoRestaurants
+	}
+
+	qCtx := QueryContext{
+		Keyword:       req.Keyword,
+		Latitude:      targetLat,
+		Longitude:     targetLng,
+		Radius:        targetRadius,
+		LocationName:  locationName,
+		IsCustomCoord: isCustomCoord,
+		Initiator:     req.InitiatorName,
+	}
+	return searchOutcome{places: places, nextPageToken: nextPageToken, pagesLoaded: pagesLoaded, qCtx: qCtx}, nil
+}
+
+// fetchUntilNonEmpty 從 pageToken 開始載入預設搜尋分頁，直到過濾後至少有 1 家、沒有下一頁或達到頁數上限為止。
+// 避免某一頁剛好全被過濾掉（範圍外、非餐飲）時就誤判為沒有餐廳。回傳累計已載入頁數。
+func (s *lotteryService) fetchUntilNonEmpty(ctx context.Context, lat, lng float64, radius int, pageToken string, pagesLoaded int) ([]googlemaps.Place, string, int, error) {
+	for pagesLoaded < maxSearchPages {
+		places, next, err := s.mapsClient.SearchOpenRestaurantsPage(ctx, lat, lng, radius, pageToken)
+		if err != nil {
+			if pagesLoaded > 0 {
+				return nil, "", pagesLoaded, fmt.Errorf("取得第 %d 頁餐廳失敗: %w", pagesLoaded+1, err)
+			}
+			return nil, "", pagesLoaded, err
+		}
+		pagesLoaded++
+		if len(places) > 0 || next == "" {
+			if pagesLoaded >= maxSearchPages {
+				next = ""
+			}
+			return places, next, pagesLoaded, nil
+		}
+		pageToken = next
+	}
+	return nil, "", pagesLoaded, nil
+}
+
+// Reroll 自 Session 中重抽下一家：目前這頁還有餐廳時不花費 API 額度；
+// 這頁抽完且 Google 還有下一頁時，才載入下一頁後再抽。
 func (s *lotteryService) Reroll(ctx context.Context, sessionID string) (*DrawResult, error) {
 	chosen, remaining, qCtx, err := s.sessionCache.PickNext(sessionID)
+	if errors.Is(err, ErrNoMoreCandidates) {
+		if loadErr := s.loadNextPage(ctx, sessionID); loadErr != nil {
+			return nil, loadErr
+		}
+		chosen, remaining, qCtx, err = s.sessionCache.PickNext(sessionID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -224,8 +354,28 @@ func (s *lotteryService) Reroll(ctx context.Context, sessionID string) (*DrawRes
 		SessionID:      sessionID,
 		Place:          chosen,
 		RemainingCount: remaining,
+		HasMore:        s.sessionCache.HasMorePages(sessionID),
 		QueryCtx:       *qCtx,
 	}, nil
+}
+
+// loadNextPage 載入 Session 的下一頁並附加至候選名單；同一 Session 同時只會有一個請求在載入
+func (s *lotteryService) loadNextPage(ctx context.Context, sessionID string) error {
+	token, qCtx, pagesLoaded, err := s.sessionCache.ClaimNextPage(sessionID)
+	if err != nil {
+		return err
+	}
+
+	places, next, newPagesLoaded, err := s.fetchUntilNonEmpty(ctx, qCtx.Latitude, qCtx.Longitude, qCtx.Radius, token, pagesLoaded)
+	if err != nil {
+		s.sessionCache.AbortNextPage(sessionID)
+		return fmt.Errorf("載入下一頁餐廳失敗: %w", err)
+	}
+
+	s.sessionCache.CompleteNextPage(sessionID, places, next)
+	// fetchUntilNonEmpty 可能連續跳過數個空頁，以實際累計頁數覆寫
+	s.sessionCache.SetNextPage(sessionID, next, newPagesLoaded)
+	return nil
 }
 
 // Close 釋放資源

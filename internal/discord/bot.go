@@ -24,7 +24,7 @@ func NewBot(cfg *config.Config, lotteryService lottery.Service) (*Bot, error) {
 		return nil, fmt.Errorf("建立 Discord Session 失敗: %w", err)
 	}
 
-	handler := NewHandler(lotteryService)
+	handler := NewHandler(lotteryService, cfg.EatListAllowedUsers)
 	session.AddHandler(handler.HandleInteraction)
 
 	return &Bot{
@@ -45,15 +45,17 @@ func (b *Bot) Start() error {
 	}
 
 	// 註冊 Slash Commands (若指定 GuildID 則註冊至測試伺服器以加速生效，否則註冊全域指令)
-	slog.Info("正在註冊 Slash Commands...", "guildID", b.cfg.DiscordGuildID)
-	for _, cmd := range SlashCommands {
-		createdCmd, err := b.session.ApplicationCommandCreate(b.cfg.DiscordAppID, b.cfg.DiscordGuildID, cmd)
-		if err != nil {
-			slog.Error("註冊 Slash Command 失敗", "name", cmd.Name, "error", err)
-			return fmt.Errorf("註冊指令 %s 失敗: %w", cmd.Name, err)
-		}
-		b.registeredCommands = append(b.registeredCommands, createdCmd)
-		slog.Info("Slash Command 註冊成功", "name", createdCmd.Name, "id", createdCmd.ID)
+	// 使用 BulkOverwrite 以完整取代既有指令集，已移除或停用的指令（如未設定允許名單的 /eat-list）不會殘留
+	cmds := commandsToRegister(len(b.cfg.EatListAllowedUsers) > 0)
+	slog.Info("正在註冊 Slash Commands...", "guildID", b.cfg.DiscordGuildID, "count", len(cmds))
+	created, err := b.session.ApplicationCommandBulkOverwrite(b.cfg.DiscordAppID, b.cfg.DiscordGuildID, cmds)
+	if err != nil {
+		slog.Error("註冊 Slash Commands 失敗", "error", err)
+		return fmt.Errorf("註冊指令失敗: %w", err)
+	}
+	b.registeredCommands = created
+	for _, cmd := range created {
+		slog.Info("Slash Command 註冊成功", "name", cmd.Name, "id", cmd.ID)
 	}
 
 	return nil

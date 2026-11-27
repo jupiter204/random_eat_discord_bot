@@ -128,3 +128,54 @@ func TestSessionCache_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestSessionCache_MaxSessionsEvictsEarliestExpiry(t *testing.T) {
+	cache := NewSessionCacheWithLimit(2)
+	defer cache.Stop()
+
+	places := []googlemaps.Place{{ID: "p1"}}
+	cache.Store("short", places, QueryContext{}, 1*time.Minute)
+	cache.Store("long", places, QueryContext{}, 10*time.Minute)
+	cache.Store("new", places, QueryContext{}, 10*time.Minute)
+
+	if _, ok := cache.Get("short"); ok {
+		t.Errorf("expected earliest-expiring session to be evicted when limit reached")
+	}
+	for _, id := range []string{"long", "new"} {
+		if _, ok := cache.Get(id); !ok {
+			t.Errorf("expected session %s to be kept", id)
+		}
+	}
+}
+
+func TestSessionCache_MaxSessionsEvictsExpiredFirst(t *testing.T) {
+	cache := NewSessionCacheWithLimit(2)
+	defer cache.Stop()
+
+	places := []googlemaps.Place{{ID: "p1"}}
+	cache.Store("expired", places, QueryContext{}, -1*time.Second)
+	cache.Store("live", places, QueryContext{}, 10*time.Minute)
+	cache.Store("new", places, QueryContext{}, 5*time.Minute)
+
+	for _, id := range []string{"live", "new"} {
+		if _, ok := cache.Get(id); !ok {
+			t.Errorf("expected session %s to be kept; expired session should be evicted first", id)
+		}
+	}
+}
+
+func TestSessionCache_OverwriteExistingDoesNotEvict(t *testing.T) {
+	cache := NewSessionCacheWithLimit(2)
+	defer cache.Stop()
+
+	places := []googlemaps.Place{{ID: "p1"}}
+	cache.Store("a", places, QueryContext{}, 10*time.Minute)
+	cache.Store("b", places, QueryContext{}, 10*time.Minute)
+	cache.Store("a", places, QueryContext{}, 10*time.Minute)
+
+	for _, id := range []string{"a", "b"} {
+		if _, ok := cache.Get(id); !ok {
+			t.Errorf("expected session %s to be kept when overwriting an existing id", id)
+		}
+	}
+}
