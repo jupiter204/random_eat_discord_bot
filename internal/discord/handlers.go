@@ -88,8 +88,9 @@ func (h *Handler) handleSetCommand(s *discordgo.Session, i *discordgo.Interactio
 
 	options := parseOptions(i.ApplicationCommandData().Options)
 	var lat, lng float64
-	var radius int = 1000
-	var name string
+	// radius 與 name 未帶入時保持 nil，代表沿用既有設定
+	var radius *int
+	var name *string
 
 	if v, ok := options["latitude"]; ok {
 		lat = v.FloatValue()
@@ -98,10 +99,21 @@ func (h *Handler) handleSetCommand(s *discordgo.Session, i *discordgo.Interactio
 		lng = v.FloatValue()
 	}
 	if v, ok := options["radius"]; ok {
-		radius = int(v.IntValue())
+		r := int(v.IntValue())
+		radius = &r
 	}
 	if v, ok := options["name"]; ok {
-		name = v.StringValue()
+		n := v.StringValue()
+		name = &n
+	}
+	if v, ok := options["clear_name"]; ok && v.BoolValue() {
+		if name != nil {
+			editEmbed(s, i, RenderErrorEmbed("設定失敗", "`name` 與 `clear_name` 不能同時使用"), nil)
+			return
+		}
+		// 空字串代表清除別名
+		empty := ""
+		name = &empty
 	}
 
 	userID := getUserID(i)
@@ -300,6 +312,7 @@ var publicErrors = []error{
 	lottery.ErrNoMoreCandidates,
 	lottery.ErrLoadingMore,
 	lottery.ErrNameTooLong,
+	lottery.ErrNameBlank,
 	lottery.ErrKeywordTooLong,
 }
 

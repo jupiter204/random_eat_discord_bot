@@ -94,6 +94,20 @@ func (p *Place) IsOpenNow() bool {
 	return false
 }
 
+// IsClosedAt 依搜尋當下取得的 nextCloseTime 判斷店家在 now 時是否已打烊。
+// 用於 Session 快取期間：搜尋時營業中、之後才打烊的店家不應再被抽出。
+// 無 nextCloseTime（如 24 小時營業）或格式無法解析時視為未打烊。
+func (p *Place) IsClosedAt(now time.Time) bool {
+	if p.CurrentOpeningHours == nil || p.CurrentOpeningHours.NextCloseTime == "" {
+		return false
+	}
+	closeAt, err := time.Parse(time.RFC3339, p.CurrentOpeningHours.NextCloseTime)
+	if err != nil {
+		return false
+	}
+	return !now.Before(closeAt)
+}
+
 // FilterOpenPlaces 過濾出只包含目前正在營業的店家清單
 func FilterOpenPlaces(places []Place) []Place {
 	openPlaces := make([]Place, 0, len(places))
@@ -165,8 +179,9 @@ func (p *Place) TodayOpeningHours() string {
 		}
 	}
 
-	// 若未匹配前綴，回傳第一筆
-	return hours.WeekdayDescriptions[0]
+	// 前綴比對不到時無法確定哪一筆是今天：weekdayDescriptions 的順序與一週起始日依語系而定，
+	// 不可用索引推算，以免把其他天的時間當成今日顯示
+	return "未提供今日營業時間"
 }
 
 // Haversine 計算地球表面兩坐標點間的大圓距離（公尺）

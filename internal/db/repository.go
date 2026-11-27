@@ -8,9 +8,14 @@ import (
 	"time"
 )
 
+// DefaultRadius 首次建立偏好且未指定半徑時使用的預設值（公尺）
+const DefaultRadius = 1000
+
 // Repository 定義資料存取介面
 type Repository interface {
-	UpsertPreference(ctx context.Context, pref *UserPreference) error
+	// UpsertPreference 新增或更新使用者偏好；name、radius 為 nil 時保留既有值（首次建立則為空別名與 DefaultRadius），
+	// 合併與寫入在同一條 SQL 內完成，避免並行更新互相覆蓋。回傳寫入後的完整設定。
+	UpsertPreference(ctx context.Context, userID string, lat, lng float64, name *string, radius *int) (*UserPreference, error)
 	GetPreference(ctx context.Context, userID string) (*UserPreference, error)
 	DeletePreference(ctx context.Context, userID string) error
 }
@@ -24,23 +29,35 @@ func NewRepository(db *sql.DB) Repository {
 	return &sqliteRepository{db: db}
 }
 
-// UpsertPreference 新增或更新使用者偏好
-func (r *sqliteRepository) UpsertPreference(ctx context.Context, pref *UserPreference) error {
+// UpsertPreference 新增或更新使用者偏好（部分更新，單一 SQL 原子完成）
+func (r *sqliteRepository) UpsertPreference(ctx context.Context, userID string, lat, lng float64, name *string, radius *int) (*UserPreference, error) {
 	query := `
 	INSERT INTO user_preferences (user_id, location_name, latitude, longitude, radius, updated_at)
-	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	VALUES (?1, COALESCE(?2, ''), ?3, ?4, COALESCE(?5, ?6), CURRENT_TIMESTAMP)
 	ON CONFLICT(user_id) DO UPDATE SET
-		location_name = excluded.location_name,
+		location_name = COALESCE(?2, location_name),
 		latitude = excluded.latitude,
 		longitude = excluded.longitude,
-		radius = excluded.radius,
-		updated_at = CURRENT_TIMESTAMP;
+		radius = COALESCE(?5, radius),
+		updated_at = CURRENT_TIMESTAMP
+	RETURNING user_id, location_name, latitude, longitude, radius, updated_at;
 	`
-	_, err := r.db.ExecContext(ctx, query, pref.UserID, pref.LocationName, pref.Latitude, pref.Longitude, pref.Radius)
-	if err != nil {
-		return fmt.Errorf("upsert preference error: %w", err)
+	// nil 指標以 SQL NULL 傳入，交由 COALESCE 保留既有值
+	var nameArg, radiusArg any
+	if name != nil {
+		nameArg = *name
 	}
-	return nil
+	if radius != nil {
+		radiusArg = *radius
+	}
+
+	var pref UserPreference
+	err := r.db.QueryRowContext(ctx, query, userID, nameArg, lat, lng, radiusArg, DefaultRadius).
+		Scan(&pref.UserID, &pref.LocationName, &pref.Latitude, &pref.Longitude, &pref.Radius, &pref.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("upsert preference error: %w", err)
+	}
+	return &pref, nil
 }
 
 // GetPreference 依據使用者 ID 取得預設偏好設定

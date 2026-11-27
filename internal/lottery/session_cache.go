@@ -143,8 +143,8 @@ func (c *inMemorySessionCache) Delete(sessionID string) {
 	delete(c.sessions, sessionID)
 }
 
-// PickNext 隨機抽取一家尚未被抽過的餐廳，並回傳剩餘未抽數量。
-// 當候選餐廳已全數抽完時，回傳 ErrNoMoreCandidates，不進行無限制循環重複。
+// PickNext 隨機抽取一家尚未被抽過、且尚未打烊的餐廳，並回傳剩餘可抽數量。
+// 當候選餐廳已全數抽完（或剩餘店家皆已打烊）時，回傳 ErrNoMoreCandidates，不進行無限制循環重複。
 func (c *inMemorySessionCache) PickNext(sessionID string) (*googlemaps.Place, int, *QueryContext, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -155,12 +155,16 @@ func (c *inMemorySessionCache) PickNext(sessionID string) (*googlemaps.Place, in
 		return nil, 0, nil, ErrSessionExpired
 	}
 
-	// 找出所有尚未抽過的餐廳索引
+	// 找出所有尚未抽過、且搜尋後尚未打烊的餐廳索引（同一 ID 只計一次）
+	now := time.Now()
 	var availableIndices []int
+	seen := make(map[string]bool, len(s.Places))
 	for idx, p := range s.Places {
-		if !s.PickedIDs[p.ID] {
-			availableIndices = append(availableIndices, idx)
+		if s.PickedIDs[p.ID] || seen[p.ID] || p.IsClosedAt(now) {
+			continue
 		}
+		seen[p.ID] = true
+		availableIndices = append(availableIndices, idx)
 	}
 
 	// 若所有店家都已抽過，不重新循環，回傳候選用罄錯誤
@@ -173,7 +177,8 @@ func (c *inMemorySessionCache) PickNext(sessionID string) (*googlemaps.Place, in
 	chosenPlace := s.Places[chosenIndex]
 	s.PickedIDs[chosenPlace.ID] = true
 
-	remaining := len(s.Places) - len(s.PickedIDs)
+	// 剩餘數為「還能被抽出的店家數」，已打烊或重複的店家不計入，避免按鈕顯示可抽卻抽不到
+	remaining := len(availableIndices) - 1
 	qCtx := s.QueryCtx
 
 	return &chosenPlace, remaining, &qCtx, nil

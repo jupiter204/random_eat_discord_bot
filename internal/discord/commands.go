@@ -76,7 +76,7 @@ var (
 				{
 					Type:        discordgo.ApplicationCommandOptionInteger,
 					Name:        "radius",
-					Description: "搜尋半徑 (公尺，預設 1000，範圍 100~5000)",
+					Description: "搜尋半徑 (公尺，範圍 100~5000；未填則沿用目前設定，首次預設 1000)",
 					Required:    false,
 					MinValue:    &minRadius,
 					MaxValue:    maxRadius,
@@ -84,9 +84,15 @@ var (
 				{
 					Type:        discordgo.ApplicationCommandOptionString,
 					Name:        "name",
-					Description: "位置別名 (例如: 公司、家)",
+					Description: "位置別名 (例如: 公司、家；未填則沿用目前設定)",
 					Required:    false,
 					MaxLength:   lottery.MaxLocationNameLength,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "clear_name",
+					Description: "清除已儲存的位置別名 (不可與 name 同時使用)",
+					Required:    false,
 				},
 			},
 		},

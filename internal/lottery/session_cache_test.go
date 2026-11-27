@@ -179,3 +179,64 @@ func TestSessionCache_OverwriteExistingDoesNotEvict(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionCache_SkipsPlacesClosedSinceSearch(t *testing.T) {
+	cache := NewSessionCache()
+	defer cache.Stop()
+
+	past := time.Now().Add(-1 * time.Minute).Format(time.RFC3339)
+	future := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
+	places := []googlemaps.Place{
+		{ID: "closed", CurrentOpeningHours: &googlemaps.OpeningHours{NextCloseTime: past}},
+		{ID: "open", CurrentOpeningHours: &googlemaps.OpeningHours{NextCloseTime: future}},
+		{ID: "24h", CurrentOpeningHours: &googlemaps.OpeningHours{}},
+	}
+	cache.Store("s", places, QueryContext{}, time.Minute)
+
+	picked := map[string]bool{}
+	p, remaining, _, err := cache.PickNext("s")
+	if err != nil {
+		t.Fatalf("PickNext failed: %v", err)
+	}
+	picked[p.ID] = true
+	if remaining != 1 {
+		t.Errorf("closed place must not count as remaining, expected 1 got %d", remaining)
+	}
+
+	p, remaining, _, err = cache.PickNext("s")
+	if err != nil {
+		t.Fatalf("PickNext failed: %v", err)
+	}
+	picked[p.ID] = true
+	if remaining != 0 {
+		t.Errorf("expected 0 remaining, got %d", remaining)
+	}
+
+	if picked["closed"] {
+		t.Errorf("place closed since search must never be picked")
+	}
+	if _, _, _, err := cache.PickNext("s"); err != ErrNoMoreCandidates {
+		t.Errorf("expected ErrNoMoreCandidates when only closed places remain, got %v", err)
+	}
+}
+
+func TestSessionCache_DuplicateIDsCountedOnce(t *testing.T) {
+	cache := NewSessionCache()
+	defer cache.Stop()
+
+	cache.Store("s", []googlemaps.Place{{ID: "a"}, {ID: "a"}, {ID: "b"}}, QueryContext{}, time.Minute)
+
+	_, remaining, _, err := cache.PickNext("s")
+	if err != nil {
+		t.Fatalf("PickNext failed: %v", err)
+	}
+	if remaining != 1 {
+		t.Errorf("duplicate IDs must be counted once, expected remaining 1 got %d", remaining)
+	}
+	if _, _, _, err := cache.PickNext("s"); err != nil {
+		t.Errorf("second pick should succeed, got %v", err)
+	}
+	if _, _, _, err := cache.PickNext("s"); err != ErrNoMoreCandidates {
+		t.Errorf("expected ErrNoMoreCandidates, got %v", err)
+	}
+}

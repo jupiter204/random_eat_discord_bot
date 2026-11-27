@@ -146,7 +146,7 @@ flowchart TD
       }
     }
     ```
-  - 餐飲類型過濾：透過 Field Mask 請求 `places.types`，僅保留 `restaurant`、`cafe`、`meal_takeaway`、`bakery` 或任何 `*_restaurant` 子類型之店家。
+  - 餐飲類型過濾：透過 Field Mask 請求 `places.types`，僅保留 `FoodPlaceTypes`（Google Table A「Food and Drink」分類中不以 `_restaurant` 結尾之類型，如 `restaurant`、`cafe`、`coffee_shop`、`tea_house`、`juice_shop`、`dessert_shop`、`ice_cream_shop`、`bakery`、`food_court`、`snack_bar` 等；刻意排除 `bar`、`pub`、`wine_bar`、`brewery` 等以酒類為主之類型）或任何 `*_restaurant` 子類型之店家。
   - 不使用 `includedType`/`strictTypeFiltering`：限定單一類型會在搜尋「咖啡」、「麵包」等關鍵字時排除咖啡廳與麵包店，改由應用層餐飲類型過濾。
   - 延遲分頁（Lazy Pagination）：
     - `/eat` 僅載入第 1 頁；若第 1 頁過濾後為 0 筆且存在 `nextPageToken`，才繼續往下載入，避免誤判無結果。
@@ -161,6 +161,7 @@ flowchart TD
   - 僅保留 API 明確回傳 `currentOpeningHours.openNow == true` 之店家；若為 `false` 或 `nil`/未知則一律排除，不以 regularOpeningHours 誤判即時營業狀態。
 - **時區解析（Timezone Awareness）**：
   - 依據 API 回傳之 `places.timeZone`（IANA ID 如 `Asia/Taipei`）或 `places.utcOffsetMinutes` 解析店家當地時間，對應精確今日星期，非硬編碼單一時區。
+  - 今日營業時間以星期前綴（星期一／週一／Monday）比對 `weekdayDescriptions`；比對不到時顯示「未提供今日營業時間」。`weekdayDescriptions` 的順序與一週起始日依語系而定，不以索引推算，避免把其他天的時間當成今日顯示。
 - **Field Mask 與語系設定**：
   - Header `X-Goog-FieldMask`：
     - `places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken`
@@ -184,6 +185,9 @@ flowchart TD
   - Session 數量上限 1000 筆：達上限時先清除過期 Session，仍滿則淘汰最早到期者。
   - 設定 10 分鐘 TTL，並具備背景清理 Goroutine（支援安全多次呼叫 `Stop()`）。
   - 記錄已抽取的店家 ID；重抽時自剩餘候選隨機挑選。
+  - 打烊排除：搜尋時營業中、但依 `currentOpeningHours.nextCloseTime` 判斷已打烊之店家不會被抽出，亦不計入剩餘數。
+  - 抽不到時自動往下一頁找：`/eat` 首抽與 Reroll 共用相同邏輯，目前沒有可抽店家（已抽完、皆已打烊，或新載入頁全為重複店家）且仍有下一頁時，載入下一頁再抽，最多 3 頁；`/eat` 首抽最終仍抽不到時回傳「找不到營業中的餐廳」；首抽載入下一頁時 API 失敗亦回傳此訊息，錯誤細節僅記於 log。
+  - 剩餘數為「仍可被抽出之店家數」（排除已抽、已打烊與重複 ID）。
   - **非循環終止語意**：當所有候選皆已抽出且沒有下一頁時，回傳 `ErrNoMoreCandidates`（「沒有更多候選餐廳，請重新使用 /eat」），不無限循環重抽先前看過的店家。
 - **隨機演算法**：使用 Go 標準庫 `math/rand/v2`。
 
@@ -195,8 +199,11 @@ flowchart TD
   1. `/set`（設定個人預設坐標）：
      - `latitude`（緯度，Number，必填，例如 `25.0339`）
      - `longitude`（經度，Number，必填，例如 `121.5644`）
-     - `radius`（搜尋半徑_公尺，Integer，選填，預設 1000，範圍 100~5000）
-     - `name`（位置別名，String，選填，最多 32 字，例如「公司」、「家」）
+     - `radius`（搜尋半徑_公尺，Integer，選填，範圍 100~5000；未填則沿用既有設定，首次設定預設 1000）
+     - `name`（位置別名，String，選填，最多 32 字，例如「公司」、「家」；未填則沿用既有設定）
+     - `clear_name`（Boolean，選填）：設為 True 時清除已儲存的別名；不可與 `name` 同時使用。
+     - `name` 只含空白時拒絕並提示改用 `clear_name`，避免誤清除別名。
+     - 部分更新語意：重新 `/set` 時僅覆寫有帶入的欄位，坐標為必填故每次皆更新；合併與寫入以單一 SQL（`INSERT ... ON CONFLICT DO UPDATE` + `COALESCE` + `RETURNING`）原子完成，並行更新不會互相覆蓋。
      - 回應模式：`MessageFlagsEphemeral`（私密訊息，保護隱私）。
   2. `/eat`（隨機抽餐廳）：
      - `keyword`（食物種類或關鍵字，String，選填，最多 50 字，例如「拉麵」）
@@ -208,6 +215,7 @@ flowchart TD
      - 回應模式：`MessageFlagsEphemeral`。
   4. `/eat-list`（測試用，列出完整候選名單）：
      - 參數同 `/eat`，與 `/eat` 共用搜尋邏輯，依距離排序，回應模式為 Ephemeral。
+     - 與 `/eat` 相同地排除依 `nextCloseTime` 判斷已打烊之店家，名單與可抽到的店一致。
      - 僅限 `EAT_LIST_ALLOWED_USERS`（逗號分隔之 Discord 使用者 ID）內的使用者使用；其他使用者收到 Ephemeral 無權限提示且不呼叫 API。
      - 未設定 `EAT_LIST_ALLOWED_USERS` 時不註冊此指令。
   5. `/help`（指令教學與坐標取得方式說明）：
@@ -252,6 +260,8 @@ flowchart TD
   - [x] `latitude` 與 `longitude` 成對性驗證與 NaN/Inf 防護
   - [x] `/eat` 公開卡片不洩漏使用者私密別名
   - [x] Session Cache 抽完即止，不無限循環重複
+  - [x] 快取期間已打烊之店家不會被重抽
+  - [x] `/set` 部分更新，不覆寫未帶入之別名與半徑
   - [x] Session Cache `Stop()` 具備等冪性（sync.Once 防 panic）
   - [x] Session Cache 支援高並行存取安全性（零 Data Race）
   - [x] 延遲分頁：Reroll 抽完才載入下一頁，同 Session 並行點擊僅呼叫一次 API，失敗可重試

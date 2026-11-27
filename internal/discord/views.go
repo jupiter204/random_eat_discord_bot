@@ -250,7 +250,7 @@ func RenderHelpEmbed() *discordgo.MessageEmbed {
 		Fields: []*discordgo.MessageEmbedField{
 			{
 				Name:   "1️⃣ `/set` - 設定個人預設坐標（私密設定）",
-				Value:  "`/set latitude:25.0339 longitude:121.5644 [radius:1000] [name:公司]`\n儲存後，後續抽籤可直接輸入 `/eat` 免重複打坐標。",
+				Value:  "`/set latitude:25.0339 longitude:121.5644 [radius:1000] [name:公司]`\n儲存後，後續抽籤可直接輸入 `/eat` 免重複打坐標。未填的半徑與別名會沿用目前設定；要清除別名請加上 `clear_name:True`。",
 				Inline: false,
 			},
 			{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -24,6 +25,7 @@ const (
 var (
 	ErrNameTooLong            = fmt.Errorf("位置別名最多 %d 個字", MaxLocationNameLength)
 	ErrKeywordTooLong         = fmt.Errorf("關鍵字最多 %d 個字", MaxKeywordLength)
+	ErrNameBlank              = errors.New("位置別名不能只有空白；若要清除別名請使用 `clear_name:True`")
 	ErrNoPreference           = errors.New("尚未設定預設位置，請先使用 `/set` 指令或在 `/eat` 帶入坐標")
 	ErrNoRestaurants          = errors.New("在指定範圍內找不到營業中的餐廳，請嘗試擴大半徑或更換坐標")
 	ErrInvalidCoordinate      = errors.New("坐標格式不正確 (緯度範圍: -90~90, 經度範圍: -180~180)")
@@ -49,7 +51,6 @@ type DrawResult struct {
 	SessionID      string
 	Place          *googlemaps.Place
 	RemainingCount int
-	TotalCount     int
 	// HasMore 為 true 代表目前這頁抽完後還能向 Google 載入下一頁
 	HasMore  bool
 	QueryCtx QueryContext
@@ -85,7 +86,7 @@ type Service interface {
 	Draw(ctx context.Context, req DrawRequest) (*DrawResult, error)
 	Reroll(ctx context.Context, sessionID string) (*DrawResult, error)
 	List(ctx context.Context, req DrawRequest) (*ListResult, error)
-	SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) (*db.UserPreference, error)
+	SetPreference(ctx context.Context, userID string, name *string, lat, lng float64, radius *int) (*db.UserPreference, error)
 	GetPreference(ctx context.Context, userID string) (*db.UserPreference, error)
 	DeletePreference(ctx context.Context, userID string) error
 	Close()
@@ -125,33 +126,29 @@ func ValidateRadius(radius int) error {
 	return nil
 }
 
-// SetPreference 設定使用者預設位置與搜尋半徑，成功時回傳實際寫入的設定值
-func (s *lotteryService) SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) (*db.UserPreference, error) {
+// SetPreference 設定使用者預設位置；坐標必填，name 與 radius 為 nil 時沿用既有設定（首次設定則為空別名與 1000 公尺）。
+// name 指向空字串代表清除別名；只含空白的別名視為輸入錯誤（避免誤清除）。合併與寫入由 Repository 以單一 SQL 原子完成。成功時回傳實際寫入的設定值。
+func (s *lotteryService) SetPreference(ctx context.Context, userID string, name *string, lat, lng float64, radius *int) (*db.UserPreference, error) {
 	if err := ValidateCoordinates(lat, lng); err != nil {
 		return nil, err
 	}
-	if radius <= 0 {
-		radius = 1000
+	if radius != nil {
+		if err := ValidateRadius(*radius); err != nil {
+			return nil, err
+		}
 	}
-	if err := ValidateRadius(radius); err != nil {
-		return nil, err
-	}
-	name = strings.TrimSpace(name)
-	if utf8.RuneCountInString(name) > MaxLocationNameLength {
-		return nil, ErrNameTooLong
+	if name != nil {
+		trimmed := strings.TrimSpace(*name)
+		if trimmed == "" && *name != "" {
+			return nil, ErrNameBlank
+		}
+		if utf8.RuneCountInString(trimmed) > MaxLocationNameLength {
+			return nil, ErrNameTooLong
+		}
+		name = &trimmed
 	}
 
-	pref := &db.UserPreference{
-		UserID:       userID,
-		LocationName: name,
-		Latitude:     lat,
-		Longitude:    lng,
-		Radius:       radius,
-	}
-	if err := s.repo.UpsertPreference(ctx, pref); err != nil {
-		return nil, err
-	}
-	return pref, nil
+	return s.repo.UpsertPreference(ctx, userID, lat, lng, name, radius)
 }
 
 // DeletePreference 刪除使用者儲存的預設位置
@@ -177,18 +174,26 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 	s.sessionCache.Store(sessionID, places, qCtx, 10*time.Minute)
 	s.sessionCache.SetNextPage(sessionID, out.nextPageToken, out.pagesLoaded)
 
-	// 抽取第 1 家
-	chosen, remaining, _, err := s.sessionCache.PickNext(sessionID)
+	// 抽取第 1 家：搜尋到回應之間店家可能剛好打烊，抽不到時與 Reroll 相同地往下一頁找
+	chosen, remaining, _, err := s.pickWithLoad(ctx, sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("抽取餐廳失敗: %w", err)
+		s.sessionCache.Delete(sessionID)
+		if errors.Is(err, ErrNoMoreCandidates) {
+			return nil, ErrNoRestaurants
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("抽取餐廳失敗: %w", err)
+		}
+		// 第 1 頁的店剛好都打烊、載入下一頁又失敗：對使用者而言就是找不到可抽的餐廳，細節只記 log
+		slog.Warn("第 1 頁無可抽店家且載入下一頁失敗", "error", err)
+		return nil, ErrNoRestaurants
 	}
 
 	return &DrawResult{
 		SessionID:      sessionID,
 		Place:          chosen,
 		RemainingCount: remaining,
-		TotalCount:     len(places),
-		HasMore:        out.nextPageToken != "",
+		HasMore:        s.sessionCache.HasMorePages(sessionID),
 		QueryCtx:       qCtx,
 	}, nil
 }
@@ -201,8 +206,13 @@ func (s *lotteryService) List(ctx context.Context, req DrawRequest) (*ListResult
 	}
 	places, qCtx := out.places, out.qCtx
 
+	// 與 PickNext 相同地跳過搜尋後已打烊的店，確保名單與 /eat 可抽到的店一致
+	now := time.Now()
 	candidates := make([]Candidate, 0, len(places))
 	for _, p := range places {
+		if p.IsClosedAt(now) {
+			continue
+		}
 		dist := -1.0
 		if p.Location != nil {
 			dist = googlemaps.Haversine(qCtx.Latitude, qCtx.Longitude, p.Location.Latitude, p.Location.Longitude)
@@ -218,6 +228,9 @@ func (s *lotteryService) List(ctx context.Context, req DrawRequest) (*ListResult
 		return di < dj
 	})
 
+	if len(candidates) == 0 && out.nextPageToken == "" {
+		return nil, ErrNoRestaurants
+	}
 	return &ListResult{Candidates: candidates, HasMore: out.nextPageToken != "", QueryCtx: qCtx}, nil
 }
 
@@ -329,13 +342,7 @@ func (s *lotteryService) fetchUntilNonEmpty(ctx context.Context, keyword string,
 // Reroll 自 Session 中重抽下一家：目前這頁還有餐廳時不花費 API 額度；
 // 這頁抽完且 Google 還有下一頁時，才載入下一頁後再抽。
 func (s *lotteryService) Reroll(ctx context.Context, sessionID string) (*DrawResult, error) {
-	chosen, remaining, qCtx, err := s.sessionCache.PickNext(sessionID)
-	if errors.Is(err, ErrNoMoreCandidates) {
-		if loadErr := s.loadNextPage(ctx, sessionID); loadErr != nil {
-			return nil, loadErr
-		}
-		chosen, remaining, qCtx, err = s.sessionCache.PickNext(sessionID)
-	}
+	chosen, remaining, qCtx, err := s.pickWithLoad(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +354,21 @@ func (s *lotteryService) Reroll(ctx context.Context, sessionID string) (*DrawRes
 		HasMore:        s.sessionCache.HasMorePages(sessionID),
 		QueryCtx:       *qCtx,
 	}, nil
+}
+
+// pickWithLoad 自 Session 抽一家；沒有可抽的店家時載入下一頁再抽，直到抽到、沒有下一頁或達頁數上限為止。
+// 涵蓋下一頁全為重複店家、或新載入的店家已打烊等「載入了卻仍抽不到」的情況。
+// 沒有下一頁時回傳 ErrNoMoreCandidates。
+func (s *lotteryService) pickWithLoad(ctx context.Context, sessionID string) (*googlemaps.Place, int, *QueryContext, error) {
+	for attempt := 0; ; attempt++ {
+		chosen, remaining, qCtx, err := s.sessionCache.PickNext(sessionID)
+		if !errors.Is(err, ErrNoMoreCandidates) || attempt >= maxSearchPages {
+			return chosen, remaining, qCtx, err
+		}
+		if loadErr := s.loadNextPage(ctx, sessionID); loadErr != nil {
+			return nil, 0, nil, loadErr
+		}
+	}
 }
 
 // loadNextPage 載入 Session 的下一頁並附加至候選名單；同一 Session 同時只會有一個請求在載入

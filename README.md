@@ -14,7 +14,7 @@
 - 🕔 **明確營業中過濾**：系統會使用 Google Places API 提供的 `currentOpeningHours.openNow` 判斷目前營業狀態，只保留 API 明確標示為營業中的餐廳；營業狀態未知的店家會排除。
 - 🌐 **精確時區支援**：營業時間依據店家所在地時區（`timeZone` / `utcOffsetMinutes`）動態計算今日星期，跨國與跨時區地點皆能精確對應當地營業時間。
 - 🎯 **搜尋流程與半徑保證**：
-    - **搜尋方式**：有無 keyword 皆呼叫 Text Search (`POST /v1/places:searchText`)，`textQuery` 為使用者輸入的 keyword（未提供時為「餐廳」），搭配 `openNow: true`（由 API 端過濾營業中），以涵蓋搜尋半徑的矩形 `locationRestriction` 硬性限制範圍，每頁 20 筆；應用層再過濾餐飲類型（restaurant、cafe、meal_takeaway、bakery 及各 `*_restaurant` 子類型）、營業中與 Haversine 實際半徑。不使用 `includedType`/`strictTypeFiltering`，避免搜尋「咖啡」、「麵包」時排除咖啡廳與麵包店。
+    - **搜尋方式**：有無 keyword 皆呼叫 Text Search (`POST /v1/places:searchText`)，`textQuery` 為使用者輸入的 keyword（未提供時為「餐廳」），搭配 `openNow: true`（由 API 端過濾營業中），以涵蓋搜尋半徑的矩形 `locationRestriction` 硬性限制範圍，每頁 20 筆；應用層再過濾餐飲類型（Google Table A「Food and Drink」中的餐廳、咖啡、茶飲、甜點、烘焙、小吃等類型及各 `*_restaurant` 子類型，排除以酒類為主的 bar/pub 等）、營業中與 Haversine 實際半徑。不使用 `includedType`/`strictTypeFiltering`，避免搜尋「咖啡」、「麵包」時排除咖啡廳與麵包店。
     - **延遲分頁**：`/eat` 只載入第 1 頁（若過濾後為 0 筆才往下翻），「再抽一家」抽完這頁時才以相同 keyword 載入下一頁，最多 3 頁（60 筆）；同一 Session 同時只會有一個請求載入下一頁。
 - 🎲 **客觀隨機抽選**：隨機選擇範圍是 Google Places API 搜尋並通過應用程式條件篩選後的候選集合，而非保證涵蓋指定半徑內所有餐廳。
 - 🔒 **隱私防護**：
@@ -65,9 +65,9 @@
 
 | 指令    | 說明                             | 參數                                                                                                                                                     | 回應模式                 |
 | :------ | :------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- |
-| `/set`  | 設定個人的預設搜尋座標與半徑     | `latitude` (必填/緯度)<br>`longitude` (必填/經度)<br>`radius` (選填/搜尋半徑公尺，預設 1000m)<br>`name` (選填/位置別名，如「公司」)                      | 🔒 私密訊息 (僅自己可見) |
+| `/set`  | 設定個人的預設搜尋座標與半徑     | `latitude` (必填/緯度)<br>`longitude` (必填/經度)<br>`radius` (選填/搜尋半徑公尺，未填沿用目前設定，首次預設 1000m)<br>`name` (選填/位置別名，如「公司」，未填沿用目前設定)<br>`clear_name` (選填/設為 True 清除別名；`name` 只輸入空白會被拒絕)                      | 🔒 私密訊息 (僅自己可見) |
 | `/eat`  | 隨機抽取營業中的餐廳             | `keyword` (選填/指定餐點種類，如「拉麵」、「火鍋」)<br>`latitude` (選填/臨時指定緯度)<br>`longitude` (選填/臨時指定經度)<br>`radius` (選填/覆蓋預設半徑)     | 📢 公開頻道訊息          |
-| `/eat-list` | （限指定測試者）列出抽籤候選名單的全部餐廳，依距離排序；僅在設定 `EAT_LIST_ALLOWED_USERS` 時註冊 | 同 `/eat` | 🔒 私密訊息 (僅自己可見) |
+| `/eat-list` | （限指定測試者）列出抽籤候選名單的全部餐廳（與 `/eat` 相同地排除搜尋後已打烊者），依距離排序；僅在設定 `EAT_LIST_ALLOWED_USERS` 時註冊 | 同 `/eat` | 🔒 私密訊息 (僅自己可見) |
 | `/unset` | 刪除已儲存的個人預設座標       | 無                                                                                                                                                       | 🔒 私密訊息 (僅自己可見) |
 | `/help` | 查看機器人功能教學與座標取得方式 | 無                                                                                                                                                       | 🔒 私密訊息              |
 

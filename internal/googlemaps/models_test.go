@@ -317,3 +317,55 @@ func TestPlace_IsFoodPlace(t *testing.T) {
 		}
 	}
 }
+
+func TestPlace_TodayOpeningHours_UnmatchedPrefix(t *testing.T) {
+	// 前綴無法比對（例如非預期語系）時，不論今天星期幾都不得回傳其他天的時間；
+	// 結果與當下時間無關，避免跨午夜時測試不穩定
+	p := Place{
+		TimeZone: &TimeZone{ID: "Asia/Taipei"},
+		CurrentOpeningHours: &OpeningHours{WeekdayDescriptions: []string{
+			"月曜日: A", "火曜日: B", "水曜日: C", "木曜日: D", "金曜日: E", "土曜日: F", "日曜日: G",
+		}},
+	}
+	if got := p.TodayOpeningHours(); got != "未提供今日營業時間" {
+		t.Errorf("expected unknown-today message, got %q", got)
+	}
+}
+
+func TestPlace_IsClosedAt(t *testing.T) {
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	mk := func(next string) Place {
+		return Place{CurrentOpeningHours: &OpeningHours{NextCloseTime: next}}
+	}
+	cases := map[string]struct {
+		p    Place
+		want bool
+	}{
+		"closes later":        {mk("2026-11-27T15:00:00Z"), false},
+		"closed before now":   {mk("2026-11-27T13:59:00Z"), true},
+		"closes exactly now":  {mk("2026-11-27T14:00:00Z"), true},
+		"no close time (24h)": {mk(""), false},
+		"unparseable":         {mk("not-a-time"), false},
+		"no hours":            {Place{}, false},
+	}
+	for name, tc := range cases {
+		if got := tc.p.IsClosedAt(now); got != tc.want {
+			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestIsFoodPlace_DrinkAndDessertShops(t *testing.T) {
+	for _, typ := range []string{"tea_house", "coffee_shop", "dessert_shop", "ice_cream_shop", "juice_shop", "food_court", "snack_bar", "taiwanese_restaurant"} {
+		p := Place{Types: []string{typ, "point_of_interest", "establishment"}}
+		if !p.IsFoodPlace() {
+			t.Errorf("%s should be treated as a food place", typ)
+		}
+	}
+	for _, typ := range []string{"bar", "wine_bar", "brewery", "tea_store", "food_store", "lodging"} {
+		p := Place{Types: []string{typ, "point_of_interest"}}
+		if p.IsFoodPlace() {
+			t.Errorf("%s should not be treated as a food place", typ)
+		}
+	}
+}

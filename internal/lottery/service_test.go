@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"random_eat_discord/internal/db"
 	"random_eat_discord/internal/googlemaps"
@@ -21,9 +22,21 @@ func newMockRepo() *mockRepository {
 	return &mockRepository{pref: make(map[string]*db.UserPreference)}
 }
 
-func (m *mockRepository) UpsertPreference(ctx context.Context, pref *db.UserPreference) error {
-	m.pref[pref.UserID] = pref
-	return nil
+func (m *mockRepository) UpsertPreference(ctx context.Context, userID string, lat, lng float64, name *string, radius *int) (*db.UserPreference, error) {
+	pref, ok := m.pref[userID]
+	if !ok {
+		pref = &db.UserPreference{UserID: userID, Radius: db.DefaultRadius}
+		m.pref[userID] = pref
+	}
+	pref.Latitude, pref.Longitude = lat, lng
+	if name != nil {
+		pref.LocationName = *name
+	}
+	if radius != nil {
+		pref.Radius = *radius
+	}
+	copied := *pref
+	return &copied, nil
 }
 
 func (m *mockRepository) GetPreference(ctx context.Context, userID string) (*db.UserPreference, error) {
@@ -155,7 +168,7 @@ func TestPrivacy_LocationNameNeverExposed(t *testing.T) {
 	testNames := []string{"我家", "公司", "宿舍", "住家", "我家私密住址"}
 	for _, name := range testNames {
 		userID := "user-privacy-" + name
-		_, _ = svc.SetPreference(ctx, userID, name, 25.0339, 121.5644, 1000)
+		_, _ = svc.SetPreference(ctx, userID, strPtr(name), 25.0339, 121.5644, intPtr(1000))
 
 		res, err := svc.Draw(ctx, DrawRequest{UserID: userID})
 		if err != nil {
@@ -178,7 +191,7 @@ func TestLotteryService_EmptyPlaces(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0339, 121.5644, intPtr(1000))
 
 	_, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != ErrNoRestaurants {
@@ -197,7 +210,7 @@ func TestLotteryService_OnePlaceAndExhaustion(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0339, 121.5644, intPtr(1000))
 
 	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != nil {
@@ -230,7 +243,7 @@ func TestLotteryService_MultiplePlacesAndRerollSequence(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0339, 121.5644, intPtr(1000))
 
 	res1, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != nil {
@@ -282,7 +295,7 @@ func TestLotteryService_DuplicatePlaceIDs(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0339, 121.5644, intPtr(1000))
 
 	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != nil {
@@ -360,7 +373,7 @@ func TestSetPreference_ReturnsStoredValuesAndValidatesName(t *testing.T) {
 	defer svc.Close()
 	ctx := context.Background()
 
-	pref, err := svc.SetPreference(ctx, "u1", "  公司  ", 25.0339, 121.5644, 0)
+	pref, err := svc.SetPreference(ctx, "u1", strPtr("  公司  "), 25.0339, 121.5644, nil)
 	if err != nil {
 		t.Fatalf("SetPreference failed: %v", err)
 	}
@@ -369,11 +382,11 @@ func TestSetPreference_ReturnsStoredValuesAndValidatesName(t *testing.T) {
 	}
 
 	longName := strings.Repeat("家", MaxLocationNameLength+1)
-	if _, err := svc.SetPreference(ctx, "u1", longName, 25.0339, 121.5644, 1000); err != ErrNameTooLong {
+	if _, err := svc.SetPreference(ctx, "u1", strPtr(longName), 25.0339, 121.5644, intPtr(1000)); err != ErrNameTooLong {
 		t.Errorf("expected ErrNameTooLong, got %v", err)
 	}
 	okName := strings.Repeat("家", MaxLocationNameLength)
-	if _, err := svc.SetPreference(ctx, "u1", okName, 25.0339, 121.5644, 1000); err != nil {
+	if _, err := svc.SetPreference(ctx, "u1", strPtr(okName), 25.0339, 121.5644, intPtr(1000)); err != nil {
 		t.Errorf("name at exact limit should be accepted, got %v", err)
 	}
 }
@@ -400,7 +413,7 @@ func TestDeletePreference(t *testing.T) {
 	defer svc.Close()
 	ctx := context.Background()
 
-	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0339, 121.5644, intPtr(1000))
 	if err := svc.DeletePreference(ctx, "u1"); err != nil {
 		t.Fatalf("DeletePreference failed: %v", err)
 	}
@@ -463,8 +476,8 @@ func TestLazyPaging_DrawFetchesOnlyFirstPage(t *testing.T) {
 	if client.pageCalls != 1 {
 		t.Errorf("expected Draw to fetch only 1 page, got %d calls", client.pageCalls)
 	}
-	if !res.HasMore || res.TotalCount != 2 || res.RemainingCount != 1 {
-		t.Errorf("unexpected result: HasMore=%v Total=%d Remaining=%d", res.HasMore, res.TotalCount, res.RemainingCount)
+	if !res.HasMore || res.RemainingCount != 1 {
+		t.Errorf("unexpected result: HasMore=%v Remaining=%d", res.HasMore, res.RemainingCount)
 	}
 }
 
@@ -621,5 +634,171 @@ func TestKeywordSearch_UsesLazyPagingWithSameKeyword(t *testing.T) {
 	}
 	if fmt.Sprint(client.keywords) != fmt.Sprint([]string{"拉麵", "拉麵"}) {
 		t.Errorf("next page must reuse the original keyword, got %v", client.keywords)
+	}
+}
+
+func intPtr(i int) *int       { return &i }
+func strPtr(s string) *string { return &s }
+
+func TestSetPreference_PartialUpdateKeepsExistingValues(t *testing.T) {
+	repo := newMockRepo()
+	svc := NewService(repo, &mockMapsClient{})
+	defer svc.Close()
+	ctx := context.Background()
+
+	// 首次設定未帶 name/radius：空別名、預設 1000 公尺
+	pref, err := svc.SetPreference(ctx, "u1", nil, 25.0, 121.0, nil)
+	if err != nil {
+		t.Fatalf("first SetPreference failed: %v", err)
+	}
+	if pref.LocationName != "" || pref.Radius != 1000 {
+		t.Fatalf("unexpected defaults: %+v", pref)
+	}
+
+	// 設定別名與半徑
+	if _, err := svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0, 121.0, intPtr(2500)); err != nil {
+		t.Fatalf("SetPreference failed: %v", err)
+	}
+
+	// 只更新坐標：別名與半徑必須保留
+	pref, err = svc.SetPreference(ctx, "u1", nil, 24.5, 120.5, nil)
+	if err != nil {
+		t.Fatalf("coordinate-only SetPreference failed: %v", err)
+	}
+	if pref.LocationName != "公司" || pref.Radius != 2500 || pref.Latitude != 24.5 || pref.Longitude != 120.5 {
+		t.Errorf("coordinate-only update should keep name and radius, got %+v", pref)
+	}
+
+	// 只更新半徑：別名保留
+	pref, _ = svc.SetPreference(ctx, "u1", nil, 24.5, 120.5, intPtr(300))
+	if pref.LocationName != "公司" || pref.Radius != 300 {
+		t.Errorf("radius-only update should keep name, got %+v", pref)
+	}
+
+	// 只更新別名：半徑保留
+	pref, _ = svc.SetPreference(ctx, "u1", strPtr("家"), 24.5, 120.5, nil)
+	if pref.LocationName != "家" || pref.Radius != 300 {
+		t.Errorf("name-only update should keep radius, got %+v", pref)
+	}
+
+	// 無效半徑仍須拒絕
+	if _, err := svc.SetPreference(ctx, "u1", nil, 24.5, 120.5, intPtr(50)); err != ErrInvalidRadius {
+		t.Errorf("expected ErrInvalidRadius, got %v", err)
+	}
+}
+
+func closedPlace(id string) googlemaps.Place {
+	return googlemaps.Place{ID: id, CurrentOpeningHours: &googlemaps.OpeningHours{
+		NextCloseTime: time.Now().Add(-time.Second).Format(time.RFC3339),
+	}}
+}
+
+func TestDraw_FirstPageClosedByPickTime_LoadsNextPage(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{
+		{closedPlace("closing")},
+		placesWithIDs("open"),
+	}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	res, err := svc.Draw(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw should fall back to next page, got %v", err)
+	}
+	if res.Place.ID != "open" || client.pageCalls != 2 {
+		t.Errorf("expected place from page 2, got %s after %d calls", res.Place.ID, client.pageCalls)
+	}
+}
+
+func TestDraw_AllClosedAndNoNextPage_ReturnsNoRestaurants(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{{closedPlace("closing")}}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	_, err := svc.Draw(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != ErrNoRestaurants {
+		t.Errorf("expected ErrNoRestaurants (public message), got %v", err)
+	}
+}
+
+func TestReroll_DuplicateOnlyPageContinuesToNextPage(t *testing.T) {
+	client := &mockMapsClient{pages: [][]googlemaps.Place{
+		placesWithIDs("a"),
+		placesWithIDs("a"), // 第 2 頁全與第 1 頁重複
+		placesWithIDs("b"),
+	}}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+	ctx := context.Background()
+
+	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("Draw failed: %v", err)
+	}
+	res, err = svc.Reroll(ctx, res.SessionID)
+	if err != nil {
+		t.Fatalf("Reroll should skip duplicate-only page 2 and load page 3, got %v", err)
+	}
+	if res.Place.ID != "b" || client.pageCalls != 3 {
+		t.Errorf("expected b from page 3, got %s after %d calls", res.Place.ID, client.pageCalls)
+	}
+	if res.HasMore {
+		t.Errorf("no more pages expected after page 3")
+	}
+}
+
+func TestDraw_FirstPageClosedAndNextPageFails_ReturnsNoRestaurants(t *testing.T) {
+	client := &mockMapsClient{
+		pages:   [][]googlemaps.Place{{closedPlace("closing")}, placesWithIDs("open")},
+		pageErr: map[int]error{1: errors.New("google 500 body")},
+	}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	_, err := svc.Draw(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != ErrNoRestaurants {
+		t.Errorf("expected ErrNoRestaurants when next page fails, got %v", err)
+	}
+}
+
+func TestList_SkipsPlacesClosedSinceSearch(t *testing.T) {
+	client := &mockMapsClient{places: append(placesWithIDs("open"), closedPlace("closing"))}
+	svc := NewService(newMockRepo(), client)
+	defer svc.Close()
+
+	res, err := svc.List(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(res.Candidates) != 1 || res.Candidates[0].Place.ID != "open" {
+		t.Errorf("expected only the open place, got %+v", res.Candidates)
+	}
+
+	client.places = []googlemaps.Place{closedPlace("closing")}
+	if _, err := svc.List(context.Background(), DrawRequest{UserID: "u1", Latitude: floatPtr(25.0), Longitude: floatPtr(121.5)}); err != ErrNoRestaurants {
+		t.Errorf("expected ErrNoRestaurants when every place has closed, got %v", err)
+	}
+}
+
+func TestSetPreference_BlankNameRejected(t *testing.T) {
+	repo := newMockRepo()
+	svc := NewService(repo, &mockMapsClient{})
+	defer svc.Close()
+	ctx := context.Background()
+
+	if _, err := svc.SetPreference(ctx, "u1", strPtr("公司"), 25.0, 121.0, nil); err != nil {
+		t.Fatalf("SetPreference failed: %v", err)
+	}
+	if _, err := svc.SetPreference(ctx, "u1", strPtr("   "), 25.0, 121.0, nil); err != ErrNameBlank {
+		t.Errorf("expected ErrNameBlank for whitespace-only name, got %v", err)
+	}
+	if pref, _ := svc.GetPreference(ctx, "u1"); pref.LocationName != "公司" {
+		t.Errorf("rejected blank name must not clear alias, got %q", pref.LocationName)
+	}
+
+	// clear_name 傳入空字串：清除別名
+	pref, err := svc.SetPreference(ctx, "u1", strPtr(""), 25.0, 121.0, nil)
+	if err != nil || pref.LocationName != "" {
+		t.Errorf("empty name should clear alias, got %+v, %v", pref, err)
 	}
 }

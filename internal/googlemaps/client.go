@@ -16,10 +16,17 @@ const (
 	searchFieldMask = "places.id,places.types,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.regularOpeningHours,places.utcOffsetMinutes,places.timeZone,nextPageToken"
 )
 
-// FoodPlaceTypes 為預設搜尋視為餐飲的店家類型（Google Places Table A）。
-// 僅用 restaurant 會漏掉被 Google 歸類為咖啡廳、外帶店、麵包店的用餐選擇；
-// 各類餐廳子類型（如 ramen_restaurant）另由 IsFoodPlace 以 *_restaurant 後綴判斷。
-var FoodPlaceTypes = []string{"restaurant", "cafe", "meal_takeaway", "bakery"}
+// FoodPlaceTypes 為視為餐飲的店家類型，取自 Google Places Table A「Food and Drink」分類中
+// 不以 _restaurant 結尾的類型（各類 *_restaurant 子類型另由 IsFoodPlace 以後綴判斷）。
+// 刻意排除以酒類為主的類型（bar、pub、wine_bar、brewery 等）與工廠／烘焙廠等非用餐地點。
+// 若只收 restaurant，搜「手搖飲」「甜點」「咖啡」時，只被歸類為 tea_house、dessert_shop、coffee_shop 的店會全被濾掉。
+var FoodPlaceTypes = []string{
+	"restaurant", "meal_takeaway", "meal_delivery", "food_court", "cafeteria", "diner", "bistro", "snack_bar", "steak_house",
+	"cafe", "coffee_shop", "coffee_stand", "cat_cafe", "dog_cafe", "tea_house", "juice_shop", "acai_shop",
+	"bakery", "bagel_shop", "cake_shop", "pastry_shop", "donut_shop", "dessert_shop", "ice_cream_shop", "confectionery", "chocolate_shop",
+	"deli", "sandwich_shop", "salad_shop", "noodle_shop", "kebab_shop", "hot_dog_stand", "pizza_delivery",
+	"bar_and_grill", "gastropub", "brewpub",
+}
 
 // Client 定義 Google Places API 用戶端介面
 // 搜尋設定（Text Search 每頁最多 20 筆）；未指定關鍵字時以 DefaultTextQuery 搜尋
