@@ -3,6 +3,7 @@ package lottery
 import (
 	"context"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 
@@ -130,7 +131,7 @@ func TestPrivacy_LocationNameNeverExposed(t *testing.T) {
 	testNames := []string{"我家", "公司", "宿舍", "住家", "我家私密住址"}
 	for _, name := range testNames {
 		userID := "user-privacy-" + name
-		_ = svc.SetPreference(ctx, userID, name, 25.0339, 121.5644, 1000)
+		_, _ = svc.SetPreference(ctx, userID, name, 25.0339, 121.5644, 1000)
 
 		res, err := svc.Draw(ctx, DrawRequest{UserID: userID})
 		if err != nil {
@@ -153,7 +154,7 @@ func TestLotteryService_EmptyPlaces(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
 
 	_, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != ErrNoRestaurants {
@@ -172,7 +173,7 @@ func TestLotteryService_OnePlaceAndExhaustion(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
 
 	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != nil {
@@ -205,7 +206,7 @@ func TestLotteryService_MultiplePlacesAndRerollSequence(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
 
 	res1, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != nil {
@@ -257,7 +258,7 @@ func TestLotteryService_DuplicatePlaceIDs(t *testing.T) {
 	defer svc.Close()
 
 	ctx := context.Background()
-	_ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
 
 	res, err := svc.Draw(ctx, DrawRequest{UserID: "u1"})
 	if err != nil {
@@ -327,4 +328,93 @@ func TestLotteryService_ConcurrentPickNext(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestSetPreference_ReturnsStoredValuesAndValidatesName(t *testing.T) {
+	repo := newMockRepo()
+	svc := NewService(repo, &mockMapsClient{})
+	defer svc.Close()
+	ctx := context.Background()
+
+	pref, err := svc.SetPreference(ctx, "u1", "  公司  ", 25.0339, 121.5644, 0)
+	if err != nil {
+		t.Fatalf("SetPreference failed: %v", err)
+	}
+	if pref == nil || pref.Radius != 1000 || pref.LocationName != "公司" {
+		t.Fatalf("unexpected returned preference: %+v", pref)
+	}
+
+	longName := strings.Repeat("家", MaxLocationNameLength+1)
+	if _, err := svc.SetPreference(ctx, "u1", longName, 25.0339, 121.5644, 1000); err != ErrNameTooLong {
+		t.Errorf("expected ErrNameTooLong, got %v", err)
+	}
+	okName := strings.Repeat("家", MaxLocationNameLength)
+	if _, err := svc.SetPreference(ctx, "u1", okName, 25.0339, 121.5644, 1000); err != nil {
+		t.Errorf("name at exact limit should be accepted, got %v", err)
+	}
+}
+
+func TestDraw_KeywordTooLong(t *testing.T) {
+	repo := newMockRepo()
+	svc := NewService(repo, &mockMapsClient{places: []googlemaps.Place{{ID: "p1"}}})
+	defer svc.Close()
+
+	_, err := svc.Draw(context.Background(), DrawRequest{
+		UserID:    "u1",
+		Keyword:   strings.Repeat("麵", MaxKeywordLength+1),
+		Latitude:  floatPtr(25.0339),
+		Longitude: floatPtr(121.5644),
+	})
+	if err != ErrKeywordTooLong {
+		t.Errorf("expected ErrKeywordTooLong, got %v", err)
+	}
+}
+
+func TestDeletePreference(t *testing.T) {
+	repo := newMockRepo()
+	svc := NewService(repo, &mockMapsClient{places: []googlemaps.Place{{ID: "p1"}}})
+	defer svc.Close()
+	ctx := context.Background()
+
+	_, _ = svc.SetPreference(ctx, "u1", "公司", 25.0339, 121.5644, 1000)
+	if err := svc.DeletePreference(ctx, "u1"); err != nil {
+		t.Fatalf("DeletePreference failed: %v", err)
+	}
+	if _, err := svc.Draw(ctx, DrawRequest{UserID: "u1"}); err != ErrNoPreference {
+		t.Errorf("expected ErrNoPreference after delete, got %v", err)
+	}
+}
+
+func TestList_SortedByDistanceWithSameValidation(t *testing.T) {
+	repo := newMockRepo()
+	client := &mockMapsClient{
+		places: []googlemaps.Place{
+			{ID: "far", Location: &googlemaps.LatLng{Latitude: 25.0400, Longitude: 121.5644}},
+			{ID: "unknown"},
+			{ID: "near", Location: &googlemaps.LatLng{Latitude: 25.0340, Longitude: 121.5644}},
+		},
+	}
+	svc := NewService(repo, client)
+	defer svc.Close()
+	ctx := context.Background()
+
+	res, err := svc.List(ctx, DrawRequest{UserID: "u1", Latitude: floatPtr(25.0339), Longitude: floatPtr(121.5644)})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	var order []string
+	for _, c := range res.Candidates {
+		order = append(order, c.Place.ID)
+	}
+	if strings.Join(order, ",") != "near,far,unknown" {
+		t.Errorf("unexpected order: %v", order)
+	}
+	if res.Candidates[2].DistanceMeters != -1 {
+		t.Errorf("expected -1 distance for place without location, got %v", res.Candidates[2].DistanceMeters)
+	}
+
+	// 與 Draw 共用驗證規則
+	if _, err := svc.List(ctx, DrawRequest{UserID: "nobody"}); err != ErrNoPreference {
+		t.Errorf("expected ErrNoPreference, got %v", err)
+	}
 }

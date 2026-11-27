@@ -37,18 +37,31 @@ type SessionCache interface {
 	Stop()
 }
 
+// DefaultMaxSessions 記憶體中同時保留之 Session 數量上限
+const DefaultMaxSessions = 1000
+
 type inMemorySessionCache struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	stopChan chan struct{}
-	stopOnce sync.Once
+	mu          sync.RWMutex
+	sessions    map[string]*Session
+	maxSessions int
+	stopChan    chan struct{}
+	stopOnce    sync.Once
 }
 
-// NewSessionCache 建立 In-Memory 抽籤工作階段快取實例
+// NewSessionCache 建立 In-Memory 抽籤工作階段快取實例（上限 DefaultMaxSessions 筆）
 func NewSessionCache() SessionCache {
+	return NewSessionCacheWithLimit(DefaultMaxSessions)
+}
+
+// NewSessionCacheWithLimit 建立指定 Session 數量上限的快取；超過上限時優先淘汰已過期者，其次淘汰最早到期者
+func NewSessionCacheWithLimit(maxSessions int) SessionCache {
+	if maxSessions <= 0 {
+		maxSessions = DefaultMaxSessions
+	}
 	c := &inMemorySessionCache{
-		sessions: make(map[string]*Session),
-		stopChan: make(chan struct{}),
+		sessions:    make(map[string]*Session),
+		maxSessions: maxSessions,
+		stopChan:    make(chan struct{}),
 	}
 	go c.cleanupLoop()
 	return c
@@ -59,6 +72,10 @@ func (c *inMemorySessionCache) Store(sessionID string, places []googlemaps.Place
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if _, exists := c.sessions[sessionID]; !exists && len(c.sessions) >= c.maxSessions {
+		c.evictLocked(time.Now())
+	}
+
 	c.sessions[sessionID] = &Session{
 		ID:        sessionID,
 		Places:    places,
@@ -66,6 +83,28 @@ func (c *inMemorySessionCache) Store(sessionID string, places []googlemaps.Place
 		QueryCtx:  qCtx,
 		ExpiresAt: time.Now().Add(ttl),
 	}
+}
+
+// evictLocked 騰出空間：先清除所有過期 Session，若仍達上限則淘汰最早到期的一筆（呼叫端須持有寫鎖）
+func (c *inMemorySessionCache) evictLocked(now time.Time) {
+	for id, s := range c.sessions {
+		if now.After(s.ExpiresAt) {
+			delete(c.sessions, id)
+		}
+	}
+	if len(c.sessions) < c.maxSessions {
+		return
+	}
+
+	var oldestID string
+	var oldestExpiry time.Time
+	for id, s := range c.sessions {
+		if oldestID == "" || s.ExpiresAt.Before(oldestExpiry) {
+			oldestID = id
+			oldestExpiry = s.ExpiresAt
+		}
+	}
+	delete(c.sessions, oldestID)
 }
 
 // Get 取得指定 Session（若不存在或已過期則回傳 false）

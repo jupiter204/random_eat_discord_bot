@@ -5,14 +5,25 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"random_eat_discord/internal/db"
 	"random_eat_discord/internal/googlemaps"
 )
 
+// 字串輸入長度上限（以字元計），同時用於 Slash Command 的 MaxLength 設定
+const (
+	MaxLocationNameLength = 32
+	MaxKeywordLength      = 50
+)
+
 var (
+	ErrNameTooLong            = fmt.Errorf("位置別名最多 %d 個字", MaxLocationNameLength)
+	ErrKeywordTooLong         = fmt.Errorf("關鍵字最多 %d 個字", MaxKeywordLength)
 	ErrNoPreference           = errors.New("尚未設定預設位置，請先使用 `/set` 指令或在 `/eat` 帶入坐標")
 	ErrNoRestaurants          = errors.New("在指定範圍內找不到營業中的餐廳，請嘗試擴大半徑或更換坐標")
 	ErrInvalidCoordinate      = errors.New("坐標格式不正確 (緯度範圍: -90~90, 經度範圍: -180~180)")
@@ -41,12 +52,26 @@ type DrawResult struct {
 	QueryCtx       QueryContext
 }
 
+// Candidate 候選餐廳與其距搜尋中心的距離（無坐標時為 -1）
+type Candidate struct {
+	Place          googlemaps.Place
+	DistanceMeters float64
+}
+
+// ListResult 完整候選名單
+type ListResult struct {
+	Candidates []Candidate
+	QueryCtx   QueryContext
+}
+
 // Service 抽籤核心領域介面
 type Service interface {
 	Draw(ctx context.Context, req DrawRequest) (*DrawResult, error)
 	Reroll(ctx context.Context, sessionID string) (*DrawResult, error)
-	SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) error
+	List(ctx context.Context, req DrawRequest) (*ListResult, error)
+	SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) (*db.UserPreference, error)
 	GetPreference(ctx context.Context, userID string) (*db.UserPreference, error)
+	DeletePreference(ctx context.Context, userID string) error
 	Close()
 }
 
@@ -84,16 +109,20 @@ func ValidateRadius(radius int) error {
 	return nil
 }
 
-// SetPreference 設定使用者預設位置與搜尋半徑
-func (s *lotteryService) SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) error {
+// SetPreference 設定使用者預設位置與搜尋半徑，成功時回傳實際寫入的設定值
+func (s *lotteryService) SetPreference(ctx context.Context, userID, name string, lat, lng float64, radius int) (*db.UserPreference, error) {
 	if err := ValidateCoordinates(lat, lng); err != nil {
-		return err
+		return nil, err
 	}
 	if radius <= 0 {
 		radius = 1000
 	}
 	if err := ValidateRadius(radius); err != nil {
-		return err
+		return nil, err
+	}
+	name = strings.TrimSpace(name)
+	if utf8.RuneCountInString(name) > MaxLocationNameLength {
+		return nil, ErrNameTooLong
 	}
 
 	pref := &db.UserPreference{
@@ -103,7 +132,15 @@ func (s *lotteryService) SetPreference(ctx context.Context, userID, name string,
 		Longitude:    lng,
 		Radius:       radius,
 	}
-	return s.repo.UpsertPreference(ctx, pref)
+	if err := s.repo.UpsertPreference(ctx, pref); err != nil {
+		return nil, err
+	}
+	return pref, nil
+}
+
+// DeletePreference 刪除使用者儲存的預設位置
+func (s *lotteryService) DeletePreference(ctx context.Context, userID string) error {
+	return s.repo.DeletePreference(ctx, userID)
 }
 
 // GetPreference 取得使用者預設位置
@@ -113,9 +150,65 @@ func (s *lotteryService) GetPreference(ctx context.Context, userID string) (*db.
 
 // Draw 執行餐廳抽籤
 func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult, error) {
+	places, qCtx, err := s.searchCandidates(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 建立 Session 並存入快取 (TTL: 10 分鐘)
+	sessionID := uuid.New().String()
+	s.sessionCache.Store(sessionID, places, qCtx, 10*time.Minute)
+
+	// 抽取第 1 家
+	chosen, remaining, _, err := s.sessionCache.PickNext(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("抽取餐廳失敗: %w", err)
+	}
+
+	return &DrawResult{
+		SessionID:      sessionID,
+		Place:          chosen,
+		RemainingCount: remaining,
+		TotalCount:     len(places),
+		QueryCtx:       qCtx,
+	}, nil
+}
+
+// List 回傳與 Draw 相同條件下的完整候選名單（依距離由近到遠排序），不建立 Session，供測試檢視用
+func (s *lotteryService) List(ctx context.Context, req DrawRequest) (*ListResult, error) {
+	places, qCtx, err := s.searchCandidates(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates := make([]Candidate, 0, len(places))
+	for _, p := range places {
+		dist := -1.0
+		if p.Location != nil {
+			dist = googlemaps.Haversine(qCtx.Latitude, qCtx.Longitude, p.Location.Latitude, p.Location.Longitude)
+		}
+		candidates = append(candidates, Candidate{Place: p, DistanceMeters: dist})
+	}
+	// 依距離由近到遠，無坐標者排在最後
+	sort.SliceStable(candidates, func(i, j int) bool {
+		di, dj := candidates[i].DistanceMeters, candidates[j].DistanceMeters
+		if (di < 0) != (dj < 0) {
+			return dj < 0
+		}
+		return di < dj
+	})
+
+	return &ListResult{Candidates: candidates, QueryCtx: qCtx}, nil
+}
+
+// searchCandidates 解析坐標與半徑並呼叫 Google Places API，回傳抽籤候選名單（Draw 與 List 共用，確保兩者名單一致）
+func (s *lotteryService) searchCandidates(ctx context.Context, req DrawRequest) ([]googlemaps.Place, QueryContext, error) {
 	// 經緯度若提供則必須成對提供
 	if (req.Latitude != nil && req.Longitude == nil) || (req.Latitude == nil && req.Longitude != nil) {
-		return nil, ErrCoordinatePairRequired
+		return nil, QueryContext{}, ErrCoordinatePairRequired
+	}
+	if utf8.RuneCountInString(req.Keyword) > MaxKeywordLength {
+		return nil, QueryContext{}, ErrKeywordTooLong
 	}
 
 	var targetLat, targetLng float64
@@ -126,7 +219,7 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 	// 1. 解析坐標與半徑：優先採用即時輸入，次之查詢 DB 偏好
 	if req.Latitude != nil && req.Longitude != nil {
 		if err := ValidateCoordinates(*req.Latitude, *req.Longitude); err != nil {
-			return nil, err
+			return nil, QueryContext{}, err
 		}
 		targetLat = *req.Latitude
 		targetLng = *req.Longitude
@@ -135,7 +228,7 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 
 		if req.Radius != nil {
 			if err := ValidateRadius(*req.Radius); err != nil {
-				return nil, err
+				return nil, QueryContext{}, err
 			}
 			targetRadius = *req.Radius
 		} else {
@@ -145,10 +238,10 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 		// 查詢使用者偏好
 		pref, err := s.repo.GetPreference(ctx, req.UserID)
 		if err != nil {
-			return nil, fmt.Errorf("查詢使用者偏好失敗: %w", err)
+			return nil, QueryContext{}, fmt.Errorf("查詢使用者偏好失敗: %w", err)
 		}
 		if pref == nil {
-			return nil, ErrNoPreference
+			return nil, QueryContext{}, ErrNoPreference
 		}
 
 		targetLat = pref.Latitude
@@ -159,7 +252,7 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 
 		if req.Radius != nil {
 			if err := ValidateRadius(*req.Radius); err != nil {
-				return nil, err
+				return nil, QueryContext{}, err
 			}
 			targetRadius = *req.Radius
 		} else {
@@ -177,15 +270,13 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("搜尋餐廳失敗: %w", err)
+		return nil, QueryContext{}, fmt.Errorf("搜尋餐廳失敗: %w", err)
 	}
 
 	if len(places) == 0 {
-		return nil, ErrNoRestaurants
+		return nil, QueryContext{}, ErrNoRestaurants
 	}
 
-	// 3. 建立 Session 並存入快取 (TTL: 10 分鐘)
-	sessionID := uuid.New().String()
 	qCtx := QueryContext{
 		Keyword:       req.Keyword,
 		Latitude:      targetLat,
@@ -195,22 +286,7 @@ func (s *lotteryService) Draw(ctx context.Context, req DrawRequest) (*DrawResult
 		IsCustomCoord: isCustomCoord,
 		Initiator:     req.InitiatorName,
 	}
-
-	s.sessionCache.Store(sessionID, places, qCtx, 10*time.Minute)
-
-	// 4. 抽取第 1 家
-	chosen, remaining, _, err := s.sessionCache.PickNext(sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("抽取餐廳失敗: %w", err)
-	}
-
-	return &DrawResult{
-		SessionID:      sessionID,
-		Place:          chosen,
-		RemainingCount: remaining,
-		TotalCount:     len(places),
-		QueryCtx:       qCtx,
-	}, nil
+	return places, qCtx, nil
 }
 
 // Reroll 自記憶體 Session 中重抽下一家 (不花費 API 額度)
